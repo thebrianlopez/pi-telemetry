@@ -5,8 +5,11 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 
+import { createHash } from "node:crypto";
+
 import { validateEvent } from "../src/schema/validate.ts";
 import { SCHEMA_VERSION as SNAPSHOT_VERSION } from "../src/schema/eventSchema.ts";
+import { redact } from "../src/redact.ts";
 
 /**
  * Pinned to the vendored schema snapshot so the emitter and validator can
@@ -128,6 +131,42 @@ export function resolveAgent(): string | null {
 	return process.env.AUTOMATION_METRICS_AGENT || null;
 }
 
+/**
+ * How much `agent_lifecycle` detail to emit.
+ *
+ * `full` (default) emits all five pi_event_types, matching Registry TDD F11.
+ * `session` omits `tool_execution_start` / `tool_execution_end`.
+ *
+ * Rationale: the per-tool lifecycle pair duplicates timing already carried by
+ * `tool_use` / `tool_result` on the claude_code layer. Measured on a
+ * 50-tool-call session, emitting them raises total event volume by 68%
+ * (255 events / 99 KiB vs 152 events). Consumers that only need harness-level
+ * session boundaries can set `session` and halve the write amplification.
+ *
+ * Default stays `full` so the shipped contract is schema-complete; the canary
+ * in EPIC-255 decides whether the fleet default should change.
+ */
+export type LifecycleDetail = "full" | "session";
+
+export function resolveLifecycleDetail(): LifecycleDetail {
+	return process.env.AUTOMATION_METRICS_LIFECYCLE_DETAIL === "session"
+		? "session"
+		: "full";
+}
+
+/** pi_event_types suppressed when detail is `session`. */
+const TOOL_LIFECYCLE = new Set([
+	"tool_execution_start",
+	"tool_execution_end",
+]);
+
+export function shouldEmitLifecycle(
+	piEventType: string,
+	detail: LifecycleDetail = resolveLifecycleDetail(),
+): boolean {
+	return detail === "full" || !TOOL_LIFECYCLE.has(piEventType);
+}
+
 // --- Helpers ---
 
 export function isAssistantMessage(message: unknown): message is AssistantMessage {
@@ -185,6 +224,8 @@ export interface SessionState {
 	sessionId: string;
 	cwd: string;
 	agent: string | null;
+	/** Pi session JSONL path. Metadata only — never used as agent identity. */
+	sessionFile: string | null;
 	startedAt: number;
 	inputTokens: number;
 	outputTokens: number;
@@ -198,6 +239,16 @@ export interface SessionState {
 	turns: number;
 	droppedEvents: number;
 	dropReasons: Record<string, number>;
+	// --- v2.14 session enrichment ---
+	userMessageCount: number;
+	assistantMessageCount: number;
+	toolErrorCategories: Record<string, number>;
+	toolsApproved: number;
+	toolsRejected: number;
+	usesTaskAgent: boolean;
+	usesMcp: boolean;
+	languages: Record<string, number>;
+	filesModified: Set<string>;
 }
 
 export function freshState(): SessionState {
@@ -205,6 +256,7 @@ export function freshState(): SessionState {
 		sessionId: randomUUID(),
 		cwd: process.cwd(),
 		agent: resolveAgent(),
+		sessionFile: null,
 		startedAt: Date.now(),
 		inputTokens: 0,
 		outputTokens: 0,
@@ -218,7 +270,164 @@ export function freshState(): SessionState {
 		turns: 0,
 		droppedEvents: 0,
 		dropReasons: {},
+		userMessageCount: 0,
+		assistantMessageCount: 0,
+		toolErrorCategories: {},
+		toolsApproved: 0,
+		toolsRejected: 0,
+		usesTaskAgent: false,
+		usesMcp: false,
+		languages: {},
+		filesModified: new Set<string>(),
 	};
+}
+
+// --- Prompt Capture ---
+
+/** Maximum characters retained in a prompt or output preview. */
+export const PREVIEW_LIMIT = 200;
+
+/**
+ * Prompt retention mode.
+ *
+ * `preview` (default) stores a redacted, bounded excerpt plus a hash.
+ * `hash`    stores only the hash and length — no text.
+ * `off`     stores neither.
+ *
+ * Raw prompts are never retained in any mode: the bus is a plaintext,
+ * unrotated, world-readable-by-default JSONL file.
+ */
+export type PromptCapture = "off" | "preview" | "hash";
+
+export function resolvePromptCapture(): PromptCapture {
+	const v = process.env.AUTOMATION_METRICS_PROMPT_CAPTURE;
+	return v === "off" || v === "hash" ? v : "preview";
+}
+
+export function sha256(text: string): string {
+	return `sha256:${createHash("sha256").update(text, "utf8").digest("hex")}`;
+}
+
+/** Redact, then truncate to {@link PREVIEW_LIMIT}. Redaction runs first. */
+export function preview(text: unknown): string {
+	return redact(text).slice(0, PREVIEW_LIMIT);
+}
+
+/**
+ * Build the retention-policy-aware fields for one free-text value.
+ *
+ * `length` is the pre-redaction character count, which is safe to publish and
+ * lets consumers reason about prompt size without the content.
+ */
+export function captureText(
+	text: unknown,
+	mode: PromptCapture = resolvePromptCapture(),
+): { text: string; hash: string | null; length: number } {
+	const raw = typeof text === "string" ? text : "";
+	if (mode === "off") return { text: "", hash: null, length: raw.length };
+	if (mode === "hash")
+		return { text: "", hash: raw ? sha256(raw) : null, length: raw.length };
+	return {
+		text: preview(raw),
+		hash: raw ? sha256(raw) : null,
+		length: raw.length,
+	};
+}
+
+/** Flatten a message `content` field to plain text. */
+export function messageText(message: unknown): string {
+	if (!message || typeof message !== "object") return "";
+	const content = (message as { content?: unknown }).content;
+	if (typeof content === "string") return content;
+	return contentText(content);
+}
+
+/** Last message with the given role, or undefined. */
+export function lastMessageOfRole(
+	messages: readonly unknown[],
+	role: string,
+): unknown {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const m = messages[i];
+		if (
+			m &&
+			typeof m === "object" &&
+			(m as { role?: unknown }).role === role
+		) {
+			return m;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Keyword classifier for the schema's `task_category` enum.
+ *
+ * Deliberately simple and transparent. Returns `null` rather than guessing
+ * when no signal is present — the schema declares this field nullable, and a
+ * wrong category is worse than an absent one for downstream scoring.
+ */
+const CATEGORY_PATTERNS: ReadonlyArray<[string, RegExp]> = [
+	["dispatch", /\b(dispatch|epic-\d+|milestone|claim|handoff)\b/i],
+	["bugfix", /\b(fix|bug|broken|regression|crash|error|failing|repair)\b/i],
+	["code_review", /\b(review|critique|feedback on|look over|pr\b)/i],
+	["documentation", /\b(document|readme|docs?|changelog|comment)\b/i],
+	["planning", /\b(plan|design|architect|propose|roadmap|prd|fdd|tdd)\b/i],
+	["configuration", /\b(config|configure|settings?|install|setup|env|yaml)\b/i],
+	["discovery", /\b(find|search|where is|locate|which file|grep)\b/i],
+	["exploration", /\b(explore|investigate|understand|explain|how does|what is)\b/i],
+	["confirmation", /^\s*(yes|no|ok|okay|sure|proceed|continue|approved|lgtm)\b/i],
+];
+
+export function classifyTask(text: unknown): string | null {
+	if (typeof text !== "string" || text.trim() === "") return null;
+	for (const [category, pattern] of CATEGORY_PATTERNS) {
+		if (pattern.test(text)) return category;
+	}
+	return "other";
+}
+
+// --- Pi Runtime Introspection ---
+
+/**
+ * Best-effort extraction of the Pi session header from an extension context.
+ *
+ * The ExtensionAPI context shape varies across pi-mono versions, so every
+ * access is guarded. A missing header yields nulls rather than a throw or a
+ * fabricated value — per the TDD, unobservable is not the same as absent.
+ */
+export function readSessionHeader(ctx: unknown): {
+	sessionId: string | null;
+	sessionFile: string | null;
+	cwd: string | null;
+} {
+	const empty = { sessionId: null, sessionFile: null, cwd: null };
+	try {
+		const manager = (ctx as { sessionManager?: unknown } | null)
+			?.sessionManager as
+			| { getHeader?: () => unknown; getPath?: () => unknown }
+			| undefined;
+		if (!manager) return empty;
+
+		const header =
+			typeof manager.getHeader === "function"
+				? (manager.getHeader() as Record<string, unknown> | null)
+				: null;
+		const path =
+			typeof manager.getPath === "function"
+				? manager.getPath()
+				: undefined;
+
+		return {
+			sessionId:
+				header && typeof header.id === "string" ? header.id : null,
+			sessionFile: typeof path === "string" ? path : null,
+			cwd:
+				header && typeof header.cwd === "string" ? header.cwd : null,
+		};
+	} catch {
+		return empty;
+	}
 }
 
 // --- Derived Metrics (pure) ---
@@ -249,6 +458,54 @@ export function aggregateTurnUsage(messages: readonly unknown[]): TurnUsage {
 		usage.turns++;
 	}
 	return usage;
+}
+
+/** Map a file path to a coarse language label for session enrichment. */
+export function languageOf(path: string): string | null {
+	const m = /\.([A-Za-z0-9]+)$/.exec(path);
+	if (!m) return null;
+	const ext = m[1].toLowerCase();
+	const table: Record<string, string> = {
+		ts: "typescript",
+		tsx: "typescript",
+		js: "javascript",
+		jsx: "javascript",
+		go: "go",
+		py: "python",
+		rs: "rust",
+		fish: "fish",
+		sh: "shell",
+		bash: "shell",
+		md: "markdown",
+		yaml: "yaml",
+		yml: "yaml",
+		json: "json",
+		tf: "terraform",
+		kt: "kotlin",
+		java: "java",
+		sql: "sql",
+	};
+	return table[ext] ?? null;
+}
+
+/** Extract a file path from a tool invocation's input, when present. */
+export function pathFromInput(input: unknown): string | null {
+	if (!input || typeof input !== "object") return null;
+	for (const key of ["path", "file_path", "filePath", "file"]) {
+		const v = (input as Record<string, unknown>)[key];
+		if (typeof v === "string" && v !== "") return v;
+	}
+	return null;
+}
+
+/** Tool names that indicate a file mutation. */
+const MUTATING_TOOLS = new Set(["edit", "write", "multiedit", "notebook_edit"]);
+
+export function isMutatingTool(toolName: unknown): boolean {
+	return (
+		typeof toolName === "string" &&
+		MUTATING_TOOLS.has(toolName.toLowerCase())
+	);
 }
 
 /** Share of turns routed to an Opus-class model, as a percentage. */
@@ -303,8 +560,51 @@ export function summaryMetadata(
 			// produced events its own vendored snapshot rejected.
 			dropped_events: state.droppedEvents,
 			drop_reasons: state.dropReasons,
+
+			// --- v2.14 enrichment: observable by Pi ---
+			user_message_count: state.userMessageCount,
+			assistant_message_count: state.assistantMessageCount,
+			tool_errors: state.toolErrors,
+			tool_error_categories: state.toolErrorCategories,
+			files_modified: state.filesModified.size,
+			languages: state.languages,
+			uses_task_agent: state.usesTaskAgent,
+			uses_mcp: state.usesMcp,
+			tools_approved: state.toolsApproved,
+			tools_rejected: state.toolsRejected,
+			approval_rate: approvalRate(state),
+
+			// --- v2.14 enrichment: NOT observable by Pi ---
+			// Emitted as explicit null, never omitted. The schema declares
+			// these `*_or_null`, and null distinguishes "this harness cannot
+			// see it" from "field forgotten" — a distinction arec/ahealth
+			// need to score Pi fairly against Claude Code.
+			git_commits: null,
+			git_pushes: null,
+			lines_added: null,
+			lines_removed: null,
+			user_interruptions: null,
+			user_response_times: null,
+
+			// --- Routing adoption (F-010 populates; null until then) ---
+			routing_signals_injected: 0,
+			routing_candidates_available: null,
+			routing_candidates_matched: null,
+			routing_adoption_rate: null,
 		},
 	};
+}
+
+/**
+ * Approval rate as a percentage, or `null` when nothing required approval.
+ *
+ * Null rather than 0 or 100: an empty denominator is not a 0% approval rate,
+ * and reporting one would skew cross-harness comparisons.
+ */
+export function approvalRate(state: SessionState): number | null {
+	const total = state.toolsApproved + state.toolsRejected;
+	if (total === 0) return null;
+	return Math.round((state.toolsApproved / total) * 1000) / 10;
 }
 
 // --- Extension ---
@@ -328,8 +628,39 @@ export default function (pi: ExtensionAPI) {
 		emitChecked(event, state);
 	}
 
-	pi.on("session_start", async (_event, _ctx) => {
+	/**
+	 * Normalized Pi lifecycle event (Registry TDD F11 §3).
+	 *
+	 * `session_file` is metadata only — CT-6 asserts it never becomes the
+	 * canonical agent identity.
+	 */
+	function lifecycle(piEventType: string, taskId: string | null = null): void {
+		if (!shouldEmitLifecycle(piEventType)) return;
+		send({
+			...commonFields(),
+			layer: "orchestration",
+			event_type: "agent_lifecycle",
+			command: piEventType,
+			metadata: {
+				pi_event_type: piEventType,
+				session_file: state.sessionFile,
+				task_id: taskId,
+			},
+		});
+	}
+
+	pi.on("session_start", async (_event, ctx) => {
 		state = freshState();
+
+		// Adopt Pi's own session identity when the runtime exposes it, so Pi
+		// events correlate with the session JSONL. Falls back to the generated
+		// UUID when unavailable.
+		const header = readSessionHeader(ctx);
+		if (header.sessionId) state.sessionId = header.sessionId;
+		if (header.sessionFile) state.sessionFile = header.sessionFile;
+		if (header.cwd) state.cwd = header.cwd;
+
+		lifecycle("agent_start");
 	});
 
 	pi.on("tool_call", async (event, _ctx) => {
@@ -354,6 +685,26 @@ export default function (pi: ExtensionAPI) {
 
 		state.toolDistribution[toolName] =
 			(state.toolDistribution[toolName] || 0) + 1;
+
+		// Enrichment signals derived from the invocation itself.
+		if (typeof toolName === "string") {
+			const lower = toolName.toLowerCase();
+			if (lower === "task" || lower === "agent") state.usesTaskAgent = true;
+			if (lower.startsWith("mcp__") || lower.includes("mcp"))
+				state.usesMcp = true;
+		}
+
+		if (isMutatingTool(toolName)) {
+			const path = pathFromInput(event.input);
+			if (path) {
+				state.filesModified.add(path);
+				const lang = languageOf(path);
+				if (lang)
+					state.languages[lang] = (state.languages[lang] || 0) + 1;
+			}
+		}
+
+		lifecycle("tool_execution_start");
 	});
 
 	pi.on("tool_result", async (event, _ctx) => {
@@ -370,6 +721,11 @@ export default function (pi: ExtensionAPI) {
 
 		if (event.isError) {
 			state.toolErrors++;
+			const errorClass = classifyError(toolName, event.content);
+			state.toolErrorCategories[errorClass] =
+				(state.toolErrorCategories[errorClass] || 0) + 1;
+			if (errorClass === "permission_denied") state.toolsRejected++;
+			else state.toolsApproved++;
 			send({
 				...commonFields(),
 				event_type: "tool_failure",
@@ -382,6 +738,7 @@ export default function (pi: ExtensionAPI) {
 				},
 			});
 		} else {
+			state.toolsApproved++;
 			send({
 				...commonFields(),
 				event_type: "tool_result",
@@ -397,6 +754,8 @@ export default function (pi: ExtensionAPI) {
 				},
 			});
 		}
+
+		lifecycle("tool_execution_end");
 	});
 
 	pi.on("agent_end", async (event, _ctx) => {
@@ -416,6 +775,20 @@ export default function (pi: ExtensionAPI) {
 		state.cacheReadTokens += turnCacheRead;
 		state.cacheWriteTokens += turnCacheWrite;
 
+		const messages = Array.isArray(event.messages) ? event.messages : [];
+
+		// Count message roles for session enrichment.
+		for (const m of messages) {
+			const role = (m as { role?: unknown } | null)?.role;
+			if (role === "user") state.userMessageCount++;
+			else if (role === "assistant") state.assistantMessageCount++;
+		}
+
+		const promptText = messageText(lastMessageOfRole(messages, "user"));
+		const replyText = messageText(lastMessageOfRole(messages, "assistant"));
+		const captured = captureText(promptText);
+		const reply = captureText(replyText);
+
 		if (turnOutput > 0) {
 			send({
 				...commonFields(),
@@ -426,6 +799,16 @@ export default function (pi: ExtensionAPI) {
 				layer: "cloud_llm",
 				command: "pi_agent_turn",
 				metadata: {
+					input: captured.text,
+					input_hash: captured.hash,
+					input_length: captured.length,
+					output: reply.text,
+					output_hash: reply.hash,
+					output_length: reply.length,
+					// Pi has no approval gate of its own; Claude Code supplies
+					// this. Emitted as "unknown" rather than a guessed value.
+					approval: "unknown",
+					task_category: classifyTask(promptText),
 					input_tokens: turnInput,
 					output_tokens: turnOutput,
 					cache_read_tokens: turnCacheRead,
@@ -444,6 +827,8 @@ export default function (pi: ExtensionAPI) {
 		state.modelDistribution[modelId] =
 			(state.modelDistribution[modelId] || 0) + 1;
 
+		lifecycle("model_select");
+
 		send({
 			...commonFields(),
 			event_type: "model_routing_decision",
@@ -461,6 +846,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, _ctx) => {
+		lifecycle("agent_end");
+
 		const { durationMs, metadata } = summaryMetadata(state);
 
 		send({

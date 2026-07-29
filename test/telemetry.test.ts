@@ -66,6 +66,18 @@ function readEvents(d = dir, date = new Date()): Record<string, unknown>[] {
 		.map((l) => JSON.parse(l));
 }
 
+/**
+ * Select emitted events by type.
+ *
+ * Prefer this over positional indexing: the extension also emits
+ * `agent_lifecycle` around tool and session transitions, so absolute
+ * positions are not stable and a test that indexes into the file is really
+ * asserting on unrelated behavior.
+ */
+function eventsOfType(type: string, d = dir): any[] {
+	return readEvents(d).filter((e) => e.event_type === type);
+}
+
 type Handler = (event: any, ctx?: unknown) => Promise<void> | void;
 
 /** Minimal ExtensionAPI stand-in that captures registered handlers. */
@@ -229,8 +241,8 @@ describe("F9 tool events", () => {
 		const fire = mountExtension();
 		await fire("session_start");
 		await fire("tool_call", bashToolCall("  git status --short "));
-		const [event] = readEvents() as any[];
-		expect(event.event_type).toBe("tool_use");
+		const [event] = eventsOfType("tool_use");
+		expect(event).toBeDefined();
 		expect(event.metadata.first_word).toBe("git");
 	});
 
@@ -238,8 +250,8 @@ describe("F9 tool events", () => {
 		const fire = mountExtension();
 		await fire("session_start");
 		await fire("tool_result", bashToolResult("git status", "clean"));
-		const [event] = readEvents() as any[];
-		expect(event.event_type).toBe("tool_result");
+		const [event] = eventsOfType("tool_result");
+		expect(event).toBeDefined();
 		expect(event.metadata.first_word).toBe("git");
 		expect(event.metadata.tool_use_id).toBe("tc-1");
 	});
@@ -251,8 +263,8 @@ describe("F9 tool events", () => {
 			"tool_result",
 			bashToolResult("cat nope", "cat: no such file or directory", true),
 		);
-		const [event] = readEvents() as any[];
-		expect(event.event_type).toBe("tool_failure");
+		const [event] = eventsOfType("tool_failure");
+		expect(event).toBeDefined();
 		expect(event.metadata.error_class).toBe("not_found");
 		expect(event.metadata.error_message).toContain("no such file");
 	});
@@ -309,7 +321,7 @@ describe("F10 prompt events", () => {
 		const fire = mountExtension();
 		await fire("session_start");
 		await fire("agent_end", { messages: [assistantMessage({ input: 10 })] });
-		expect(readEvents()).toHaveLength(0);
+		expect(eventsOfType("prompt_submit")).toHaveLength(0);
 	});
 });
 
