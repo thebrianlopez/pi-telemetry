@@ -27,6 +27,7 @@ import telemetry, {
 } from "../../extensions/telemetry.ts";
 import { validateEvent } from "../../src/schema/validate.ts";
 import { assistantMessage } from "../fixtures/events.ts";
+import { ANTHROPIC_KEY } from "../fixtures/secrets.ts";
 
 let dir: string;
 const saved: Record<string, string | undefined> = {};
@@ -132,7 +133,7 @@ describe("F-009 prompt enrichment", () => {
 	it("redacts secrets from the preview before truncation", async () => {
 		const fire = mountExtension();
 		await fire("session_start");
-		await turn(fire, "use sk-ant-api03-SECRETVALUE123 to auth");
+		await turn(fire, `use ${ANTHROPIC_KEY} to auth`);
 
 		const [e] = readEvents().filter((x) => x.event_type === "prompt_submit");
 		expect(e.metadata.input).not.toContain("sk-ant-");
@@ -395,7 +396,7 @@ describe("helpers", () => {
 	});
 
 	it("preview redacts before truncating", () => {
-		const text = `${"a".repeat(190)} sk-ant-SECRETVALUE`;
+		const text = `${"a".repeat(190)} ${ANTHROPIC_KEY}`;
 		expect(preview(text)).not.toContain("sk-ant-");
 	});
 });

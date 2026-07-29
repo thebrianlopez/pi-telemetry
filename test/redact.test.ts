@@ -6,24 +6,8 @@ import {
 	containsSecret,
 	redact,
 } from "../src/redact.ts";
+import { ALL_SECRETS as SECRETS } from "./fixtures/secrets.ts";
 
-/** Representative secret shapes. Values are synthetic. */
-const SECRETS = {
-	anthropic: "sk-ant-api03-AbCdEf_1234-ZzZz",
-	openai: "sk-proj0123456789abcdefXYZ",
-	githubPat: "ghp_0123456789abcdefghijklmnopqrstuvwxyz",
-	githubServer: "ghs_AbCdEf0123456789",
-	awsAccessKey: "AKIAIOSFODNN7EXAMPLE",
-	awsSecret: "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCY",
-	genericToken: "GH_TOKEN=abc123def456",
-	genericPassword: "DB_PASSWORD='hunter2'",
-	pem: [
-		"-----BEGIN RSA PRIVATE KEY-----",
-		"MIIEowIBAAKCAQEAx7Nn2vQ9L0kFakeKeyMaterialForTests",
-		"AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/=",
-		"-----END RSA PRIVATE KEY-----",
-	].join("\n"),
-};
 
 describe("redact", () => {
 	it("removes an Anthropic API key", () => {

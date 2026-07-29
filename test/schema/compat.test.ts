@@ -22,6 +22,7 @@ import telemetry, {
 	telemetryDisabled,
 } from "../../extensions/telemetry.ts";
 import { assistantMessage, bashToolCall } from "../fixtures/events.ts";
+import { ALL_SECRETS as SECRETS, CANARY } from "../fixtures/secrets.ts";
 
 /**
  * session_summary metadata keys emitted by shipped v1.0.
@@ -50,13 +51,6 @@ const V1_0_SUMMARY_KEYS = [
 	"signal_source",
 ] as const;
 
-/** Credential shapes that must never survive to the bus. Values synthetic. */
-const SECRETS = {
-	anthropic: "sk-ant-api03-LEAKCANARY_1234",
-	github: "ghp_LEAKCANARY0123456789abcdefghijkl",
-	pem: "-----BEGIN RSA PRIVATE KEY-----\nLEAKCANARYKEYMATERIAL\n-----END RSA PRIVATE KEY-----",
-	aws: "AWS_SECRET_ACCESS_KEY=LEAKCANARYsecretvalue",
-};
 
 let dir: string;
 const saved: Record<string, string | undefined> = {};
@@ -245,7 +239,7 @@ describe("F-012 privacy guards", () => {
 			messages: [
 				{
 					role: "user",
-					content: `deploy with ${SECRETS.anthropic} and ${SECRETS.github}\n${SECRETS.pem}\n${SECRETS.aws}`,
+					content: `deploy with ${SECRETS.anthropic} and ${SECRETS.githubPat}\n${SECRETS.pem}\n${SECRETS.aws}`,
 				},
 				{
 					...assistantMessage({ input: 10, output: 5 }),
@@ -260,9 +254,7 @@ describe("F-012 privacy guards", () => {
 		for (const [name, value] of Object.entries(SECRETS)) {
 			// Check the canary substring, not the whole block, so a partial
 			// leak is caught too.
-			const canary = value.includes("LEAKCANARY")
-				? "LEAKCANARY"
-				: value;
+			const canary = CANARY;
 			expect(out.includes(canary), `${name} leaked to the bus`).toBe(false);
 		}
 	});
@@ -276,12 +268,12 @@ describe("F-012 privacy guards", () => {
 			toolName: "bash",
 			input: { command: "auth" },
 			content: [
-				{ type: "text", text: `permission denied for ${SECRETS.github}` },
+				{ type: "text", text: `permission denied for ${SECRETS.githubPat}` },
 			],
 			isError: true,
 		});
 
-		expect(rawOutput().includes("LEAKCANARY")).toBe(false);
+		expect(rawOutput().includes(CANARY)).toBe(false);
 	});
 });
 
