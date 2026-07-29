@@ -5,7 +5,14 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 
-export const SCHEMA_VERSION = "2.14";
+import { validateEvent } from "../src/schema/validate.ts";
+import { SCHEMA_VERSION as SNAPSHOT_VERSION } from "../src/schema/eventSchema.ts";
+
+/**
+ * Pinned to the vendored schema snapshot so the emitter and validator can
+ * never disagree about which contract version is in force.
+ */
+export const SCHEMA_VERSION = SNAPSHOT_VERSION;
 
 // --- Emitter ---
 
@@ -40,6 +47,28 @@ export function dateFileName(date: Date): string {
 	return `${date.toISOString().slice(0, 10)}.jsonl`;
 }
 
+/** Stamp the canonical envelope onto a caller-supplied payload. */
+export function buildRecord(
+	event: Record<string, unknown>,
+	now: Date,
+): Record<string, unknown> {
+	return {
+		schema_version: SCHEMA_VERSION,
+		timestamp: formatTimestamp(now),
+		...event,
+	};
+}
+
+/**
+ * Transport primitive: stamp, serialize, append. Never throws.
+ *
+ * This function performs NO schema validation by design — it is the raw write
+ * path, and its tests cover filesystem behavior (directory creation, date
+ * rollover, concurrent append, unwritable destinations) where the payload is
+ * irrelevant. Contract enforcement lives in {@link emitChecked}, which every
+ * extension hook uses. RG-1 guards the seam by asserting that everything the
+ * extension emits validates.
+ */
 export function emit(
 	event: Record<string, unknown>,
 	opts: EmitOptions = {},
@@ -50,15 +79,47 @@ export function emit(
 			mkdirSync(dir, { recursive: true });
 		}
 		const now = opts.now ?? new Date();
-		const line = JSON.stringify({
-			schema_version: SCHEMA_VERSION,
-			timestamp: formatTimestamp(now),
-			...event,
-		});
+		const line = JSON.stringify(buildRecord(event, now));
 		appendFileSync(join(dir, dateFileName(now)), line + "\n");
 	} catch {
 		// telemetry must never crash the agent
 	}
+}
+
+/** Counters for events rejected by the schema validator. */
+export interface DropStats {
+	droppedEvents: number;
+	dropReasons: Record<string, number>;
+}
+
+/**
+ * Validate against the vendored schema snapshot, then append.
+ *
+ * Invalid events are dropped and counted rather than written or raised: a
+ * malformed event on the bus is worse than a missing one, and a throw inside a
+ * Pi lifecycle hook would degrade the harness this package exists to observe.
+ *
+ * @returns `true` when the event was written, `false` when it was dropped.
+ */
+export function emitChecked(
+	event: Record<string, unknown>,
+	stats: DropStats,
+	opts: EmitOptions = {},
+): boolean {
+	const now = opts.now ?? new Date();
+	const result = validateEvent(buildRecord(event, now));
+
+	if (!result.valid) {
+		stats.droppedEvents++;
+		for (const issue of result.issues) {
+			stats.dropReasons[issue.code] =
+				(stats.dropReasons[issue.code] ?? 0) + 1;
+		}
+		return false;
+	}
+
+	emit(event, { ...opts, now });
+	return true;
 }
 
 // --- Agent Identity ---
@@ -135,6 +196,8 @@ export interface SessionState {
 	modelDistribution: Record<string, number>;
 	promptCount: number;
 	turns: number;
+	droppedEvents: number;
+	dropReasons: Record<string, number>;
 }
 
 export function freshState(): SessionState {
@@ -153,6 +216,8 @@ export function freshState(): SessionState {
 		modelDistribution: {},
 		promptCount: 0,
 		turns: 0,
+		droppedEvents: 0,
+		dropReasons: {},
 	};
 }
 
@@ -234,6 +299,10 @@ export function summaryMetadata(
 			prompt_count: state.promptCount,
 			turns: state.turns,
 			signal_source: "pi_extension",
+			// Schema-drift visibility: a nonzero count means this package
+			// produced events its own vendored snapshot rejected.
+			dropped_events: state.droppedEvents,
+			drop_reasons: state.dropReasons,
 		},
 	};
 }
@@ -254,6 +323,11 @@ export default function (pi: ExtensionAPI) {
 		};
 	}
 
+	/** All hook emissions go through the validated path. */
+	function send(event: Record<string, unknown>): void {
+		emitChecked(event, state);
+	}
+
 	pi.on("session_start", async (_event, _ctx) => {
 		state = freshState();
 	});
@@ -267,7 +341,7 @@ export default function (pi: ExtensionAPI) {
 					)
 				: toolName;
 
-		emit({
+		send({
 			...commonFields(),
 			event_type: "tool_use",
 			command: toolName,
@@ -296,7 +370,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (event.isError) {
 			state.toolErrors++;
-			emit({
+			send({
 				...commonFields(),
 				event_type: "tool_failure",
 				command: toolName,
@@ -308,7 +382,7 @@ export default function (pi: ExtensionAPI) {
 				},
 			});
 		} else {
-			emit({
+			send({
 				...commonFields(),
 				event_type: "tool_result",
 				command: toolName,
@@ -343,9 +417,13 @@ export default function (pi: ExtensionAPI) {
 		state.cacheWriteTokens += turnCacheWrite;
 
 		if (turnOutput > 0) {
-			emit({
+			send({
 				...commonFields(),
 				event_type: "prompt_submit",
+				// Prompt events belong to the cloud_llm layer, not claude_code.
+				// commonFields() defaults to claude_code for the tool/session
+				// family; this override is required by the canonical schema.
+				layer: "cloud_llm",
 				command: "pi_agent_turn",
 				metadata: {
 					input_tokens: turnInput,
@@ -366,7 +444,7 @@ export default function (pi: ExtensionAPI) {
 		state.modelDistribution[modelId] =
 			(state.modelDistribution[modelId] || 0) + 1;
 
-		emit({
+		send({
 			...commonFields(),
 			event_type: "model_routing_decision",
 			command: "model_select",
@@ -385,7 +463,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (_event, _ctx) => {
 		const { durationMs, metadata } = summaryMetadata(state);
 
-		emit({
+		send({
 			...commonFields(),
 			event_type: "session_summary",
 			command: "session_end",
