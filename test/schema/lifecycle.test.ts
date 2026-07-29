@@ -26,11 +26,18 @@ const saved: Record<string, string | undefined> = {};
 
 beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "pi-telemetry-lc-"));
-	saved.AUTOMATION_METRICS_EVENTS_DIR =
-		process.env.AUTOMATION_METRICS_EVENTS_DIR;
-	saved.AUTOMATION_METRICS_AGENT = process.env.AUTOMATION_METRICS_AGENT;
+	for (const k of [
+		"AUTOMATION_METRICS_EVENTS_DIR",
+		"AUTOMATION_METRICS_AGENT",
+		"AUTOMATION_METRICS_LIFECYCLE_DETAIL",
+	]) {
+		saved[k] = process.env[k];
+		delete process.env[k];
+	}
 	process.env.AUTOMATION_METRICS_EVENTS_DIR = dir;
-	delete process.env.AUTOMATION_METRICS_AGENT;
+	// This suite exercises the full lifecycle contract. The shipped DEFAULT is
+	// `session`; opting in explicitly keeps that distinction visible.
+	process.env.AUTOMATION_METRICS_LIFECYCLE_DETAIL = "full";
 });
 
 afterEach(() => {
@@ -196,6 +203,36 @@ describe("F-008 lifecycle contract tests", () => {
 		// Falls back to a generated UUID rather than fabricating a path.
 		expect(typeof event.session_id).toBe("string");
 		expect(event.session_id).not.toBe("");
+	});
+
+	it("tool lifecycle events carry a join key to their tool", async () => {
+		const fire = mountExtension();
+		await fire("session_start");
+		await fire("tool_call", bashToolCall("ls", "tc-42"));
+		await fire("tool_result", bashToolResult("ls", "ok", false, "tc-42"));
+
+		const start = lifecycleEvents().find(
+			(e) => e.metadata.pi_event_type === "tool_execution_start",
+		);
+		const end = lifecycleEvents().find(
+			(e) => e.metadata.pi_event_type === "tool_execution_end",
+		);
+
+		// Without these a consumer cannot tell which tool the event brackets.
+		expect(start.metadata.tool_use_id).toBe("tc-42");
+		expect(start.metadata.tool_name).toBe("bash");
+		expect(end.metadata.tool_use_id).toBe("tc-42");
+		expect(end.metadata.tool_name).toBe("bash");
+	});
+
+	it("session-level lifecycle events carry no tool reference", async () => {
+		const fire = mountExtension();
+		await fire("session_start");
+
+		const [start] = lifecycleEvents();
+		expect(start.metadata.pi_event_type).toBe("agent_start");
+		expect(start.metadata.tool_use_id).toBeUndefined();
+		expect(start.metadata.tool_name).toBeUndefined();
 	});
 
 	it("all lifecycle events in a session share one session_id", async () => {

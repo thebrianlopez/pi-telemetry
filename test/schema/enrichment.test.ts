@@ -400,10 +400,118 @@ describe("helpers", () => {
 	});
 });
 
+describe("tool event correlation", () => {
+	it("tool_use carries a tool_use_id joinable to tool_result", async () => {
+		const fire = mountExtension();
+		await fire("session_start");
+		await fire("tool_call", {
+			type: "tool_call",
+			toolCallId: "tc-7",
+			toolName: "bash",
+			input: { command: "ls" },
+		});
+		await fire("tool_result", {
+			type: "tool_result",
+			toolCallId: "tc-7",
+			toolName: "bash",
+			input: { command: "ls" },
+			content: [{ type: "text", text: "ok" }],
+			isError: false,
+		});
+
+		const use = readEvents().find((e) => e.event_type === "tool_use");
+		const result = readEvents().find((e) => e.event_type === "tool_result");
+
+		expect(use.metadata.tool_use_id).toBe("tc-7");
+		expect(result.metadata.tool_use_id).toBe("tc-7");
+		// The pair is joinable without relying on file position.
+		expect(use.metadata.tool_use_id).toBe(result.metadata.tool_use_id);
+	});
+
+	it("a failed tool is joinable to its invocation", async () => {
+		const fire = mountExtension();
+		await fire("session_start");
+		await fire("tool_call", {
+			type: "tool_call",
+			toolCallId: "tc-9",
+			toolName: "bash",
+			input: { command: "cat missing" },
+		});
+		await fire("tool_result", {
+			type: "tool_result",
+			toolCallId: "tc-9",
+			toolName: "bash",
+			input: { command: "cat missing" },
+			content: [{ type: "text", text: "no such file" }],
+			isError: true,
+		});
+
+		const use = readEvents().find((e) => e.event_type === "tool_use");
+		const fail = readEvents().find((e) => e.event_type === "tool_failure");
+		expect(use.metadata.tool_use_id).toBe("tc-9");
+		expect(fail.metadata.tool_use_id).toBe("tc-9");
+	});
+
+	it("an interleaved pair stays joinable by id, not position", async () => {
+		const fire = mountExtension();
+		await fire("session_start");
+		// Two tools start before either finishes - positional pairing would
+		// mismatch them.
+		for (const id of ["a", "b"]) {
+			await fire("tool_call", {
+				type: "tool_call",
+				toolCallId: id,
+				toolName: "bash",
+				input: { command: `run ${id}` },
+			});
+		}
+		for (const id of ["b", "a"]) {
+			await fire("tool_result", {
+				type: "tool_result",
+				toolCallId: id,
+				toolName: "bash",
+				input: { command: `run ${id}` },
+				content: [{ type: "text", text: "ok" }],
+				isError: false,
+			});
+		}
+
+		const uses = readEvents().filter((e) => e.event_type === "tool_use");
+		const results = readEvents().filter((e) => e.event_type === "tool_result");
+		expect(uses.map((e) => e.metadata.tool_use_id)).toEqual(["a", "b"]);
+		expect(results.map((e) => e.metadata.tool_use_id)).toEqual(["b", "a"]);
+	});
+});
+
 describe("lifecycle detail control", () => {
 	it("full mode emits tool execution lifecycle events", () => {
 		expect(shouldEmitLifecycle("tool_execution_start", "full")).toBe(true);
 		expect(shouldEmitLifecycle("agent_start", "full")).toBe(true);
+	});
+
+	it("the shipped default is session, not full", async () => {
+		delete process.env.AUTOMATION_METRICS_LIFECYCLE_DETAIL;
+		const fire = mountExtension();
+		await fire("session_start");
+		for (let i = 0; i < 5; i++) {
+			await fire("tool_call", {
+				type: "tool_call",
+				toolCallId: `t${i}`,
+				toolName: "bash",
+				input: { command: "ls" },
+			});
+		}
+		await fire("session_shutdown");
+
+		const lifecycles = readEvents().filter(
+			(e) => e.event_type === "agent_lifecycle",
+		);
+		// agent_start + agent_end only.
+		expect(lifecycles).toHaveLength(2);
+		expect(lifecycles.map((e) => e.metadata.pi_event_type)).toEqual([
+			"agent_start",
+			"agent_end",
+		]);
 	});
 
 	it("session mode suppresses only the tool execution pair", () => {
@@ -412,6 +520,24 @@ describe("lifecycle detail control", () => {
 		expect(shouldEmitLifecycle("agent_start", "session")).toBe(true);
 		expect(shouldEmitLifecycle("agent_end", "session")).toBe(true);
 		expect(shouldEmitLifecycle("model_select", "session")).toBe(true);
+	});
+
+	it("opting into full measurably increases event volume", async () => {
+		process.env.AUTOMATION_METRICS_LIFECYCLE_DETAIL = "full";
+		const fireFull = mountExtension();
+		await fireFull("session_start");
+		for (let i = 0; i < 10; i++) {
+			await fireFull("tool_call", {
+				type: "tool_call",
+				toolCallId: `f${i}`,
+				toolName: "bash",
+				input: { command: "ls" },
+			});
+		}
+		await fireFull("session_shutdown");
+		expect(
+			readEvents().filter((e) => e.event_type === "agent_lifecycle"),
+		).toHaveLength(12);
 	});
 
 	it("session mode measurably reduces event volume", async () => {

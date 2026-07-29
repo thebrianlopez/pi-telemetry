@@ -141,24 +141,27 @@ export function resolveAgent(): string | null {
 /**
  * How much `agent_lifecycle` detail to emit.
  *
- * `full` (default) emits all five pi_event_types, matching Registry TDD F11.
- * `session` omits `tool_execution_start` / `tool_execution_end`.
+ * `session` (default) emits harness-level transitions only: `agent_start`,
+ * `agent_end`, `model_select`.
+ * `full` additionally emits `tool_execution_start` / `tool_execution_end`.
  *
- * Rationale: the per-tool lifecycle pair duplicates timing already carried by
- * `tool_use` / `tool_result` on the claude_code layer. Measured on a
- * 50-tool-call session, emitting them raises total event volume by 68%
- * (255 events / 99 KiB vs 152 events). Consumers that only need harness-level
- * session boundaries can set `session` and halve the write amplification.
+ * Why `session` is the default:
  *
- * Default stays `full` so the shipped contract is schema-complete; the canary
- * in EPIC-255 decides whether the fleet default should change.
+ * The per-tool lifecycle pair raises event volume 68% on a 50-tool session
+ * (255 events vs 152) while adding no dimension a consumer can join on. The
+ * information an engineer actually needs when debugging — which tool, how
+ * long, did it fail — comes from `tool_use` / `tool_result` / `tool_failure`,
+ * which now carry `tool_use_id` and are correlatable at zero extra cost.
+ *
+ * `full` remains available per-session for deep-debug runs, where volume is
+ * irrelevant and a second orchestration-layer view of tool timing is welcome.
  */
 export type LifecycleDetail = "full" | "session";
 
 export function resolveLifecycleDetail(): LifecycleDetail {
-	return process.env.AUTOMATION_METRICS_LIFECYCLE_DETAIL === "session"
-		? "session"
-		: "full";
+	return process.env.AUTOMATION_METRICS_LIFECYCLE_DETAIL === "full"
+		? "full"
+		: "session";
 }
 
 /** pi_event_types suppressed when detail is `session`. */
@@ -172,6 +175,12 @@ export function shouldEmitLifecycle(
 	detail: LifecycleDetail = resolveLifecycleDetail(),
 ): boolean {
 	return detail === "full" || !TOOL_LIFECYCLE.has(piEventType);
+}
+
+/** Correlation fields carried by tool-scoped lifecycle events. */
+export interface ToolRef {
+	toolName: string;
+	toolUseId: string;
 }
 
 // --- Helpers ---
@@ -755,7 +764,10 @@ export default function (pi: ExtensionAPI) {
 	 * `session_file` is metadata only — CT-6 asserts it never becomes the
 	 * canonical agent identity.
 	 */
-	function lifecycle(piEventType: string, taskId: string | null = null): void {
+	function lifecycle(
+		piEventType: string,
+		tool: ToolRef | null = null,
+	): void {
 		if (!shouldEmitLifecycle(piEventType)) return;
 		send({
 			...commonFields(),
@@ -765,7 +777,16 @@ export default function (pi: ExtensionAPI) {
 			metadata: {
 				pi_event_type: piEventType,
 				session_file: state.sessionFile,
-				task_id: taskId,
+				task_id: state.task.taskId,
+				// Tool-scoped lifecycle events are useless without a join key.
+				// The canonical schema does not list these, but metadata is
+				// open and extras validate. Without them a consumer cannot tell
+				// WHICH tool a tool_execution_start refers to and must guess
+				// positionally - precisely the assumption that breaks under
+				// concurrency, i.e. the case being debugged.
+				...(tool
+					? { tool_name: tool.toolName, tool_use_id: tool.toolUseId }
+					: {}),
 			},
 		});
 	}
@@ -837,6 +858,8 @@ export default function (pi: ExtensionAPI) {
 					)
 				: toolName;
 
+		const toolUseId = event.toolCallId || "";
+
 		send({
 			...commonFields(),
 			event_type: "tool_use",
@@ -845,6 +868,13 @@ export default function (pi: ExtensionAPI) {
 				tool_name: toolName,
 				source: "pi",
 				first_word: fw,
+				// The canonical schema omits tool_use_id from tool_use and
+				// declares it only on tool_result, which leaves the pair
+				// joinable only by position. Emitting it here costs nothing,
+				// validates as an extra field, and is what makes per-tool
+				// duration and hung-tool detection possible without a parallel
+				// lifecycle stream.
+				tool_use_id: toolUseId,
 			},
 		});
 
@@ -874,7 +904,10 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
-		lifecycle("tool_execution_start");
+		lifecycle("tool_execution_start", {
+			toolName,
+			toolUseId,
+		});
 	});
 
 	pi.on("tool_result", async (event, _ctx) => {
@@ -925,7 +958,10 @@ export default function (pi: ExtensionAPI) {
 			});
 		}
 
-		lifecycle("tool_execution_end");
+		lifecycle("tool_execution_end", {
+			toolName,
+			toolUseId: event.toolCallId || "",
+		});
 	});
 
 	pi.on("agent_end", async (event, _ctx) => {
