@@ -10,6 +10,13 @@ import { createHash } from "node:crypto";
 import { validateEvent } from "../src/schema/validate.ts";
 import { SCHEMA_VERSION as SNAPSHOT_VERSION } from "../src/schema/eventSchema.ts";
 import { redact } from "../src/redact.ts";
+import {
+	billingRisk,
+	resolveInboundHarness,
+	resolveTaskContext,
+	type Harness,
+	type TaskContext,
+} from "../src/taskContext.ts";
 
 /**
  * Pinned to the vendored schema snapshot so the emitter and validator can
@@ -249,6 +256,12 @@ export interface SessionState {
 	usesMcp: boolean;
 	languages: Record<string, number>;
 	filesModified: Set<string>;
+	// --- F-010 task ownership + routing ---
+	task: TaskContext;
+	boundaryEventsEmitted: number;
+	routingAvailable: number;
+	routingMatched: number;
+	bashFirstWords: Record<string, number>;
 }
 
 export function freshState(): SessionState {
@@ -279,6 +292,17 @@ export function freshState(): SessionState {
 		usesMcp: false,
 		languages: {},
 		filesModified: new Set<string>(),
+		task: {
+			taskId: null,
+			source: "none",
+			epic: null,
+			milestones: [],
+			diagnostic: null,
+		},
+		boundaryEventsEmitted: 0,
+		routingAvailable: 0,
+		routingMatched: 0,
+		bashFirstWords: {},
 	};
 }
 
@@ -385,6 +409,89 @@ export function classifyTask(text: unknown): string | null {
 		if (pattern.test(text)) return category;
 	}
 	return "other";
+}
+
+// --- Layer Routing ---
+
+/**
+ * Go CLI tools in this workspace whose use is evidence of the `go_cli` layer.
+ * Sourced from the runabout suite and the tools referenced by the routing
+ * guidance in core.
+ */
+const GO_CLI_COMMANDS = new Set([
+	"mdq",
+	"md-tree",
+	"ts-go",
+	"perfgate",
+	"shellprof",
+	"workctl",
+	"castex",
+	"chain-eval",
+	"bmux",
+	"hookval",
+	"effiscore",
+	"runway",
+	"wasend",
+]);
+
+/** Shell builtins and fish functions that evidence the `fish` layer. */
+const FISH_COMMANDS = new Set(["fish", "wk", "uinit", "gsync", "winit"]);
+
+/**
+ * Infer which layer actually did the work, from observed tool usage.
+ *
+ * Pi does not emit routing recommendations of its own — those are injected by
+ * the fish hook layer. Rather than fabricate a decision, this infers the
+ * ACTUAL layer from evidence and compares it to a recommendation supplied via
+ * environment. No recommendation means no event.
+ */
+export function inferActualLayer(
+	bashFirstWords: Record<string, number>,
+): "fish" | "go_cli" | "cloud_llm" {
+	let goCli = 0;
+	let fish = 0;
+	for (const [word, count] of Object.entries(bashFirstWords)) {
+		if (GO_CLI_COMMANDS.has(word)) goCli += count;
+		else if (FISH_COMMANDS.has(word)) fish += count;
+	}
+	if (goCli === 0 && fish === 0) return "cloud_llm";
+	return goCli >= fish ? "go_cli" : "fish";
+}
+
+export interface RoutingRecommendation {
+	recommendedLayer: "fish" | "go_cli" | "cloud_llm";
+	recommendedTool: string | null;
+	taskType: string;
+	confidence: number;
+}
+
+const ROUTING_LAYER_VALUES = new Set(["fish", "go_cli", "cloud_llm"]);
+
+/**
+ * Read an injected routing recommendation, if the hook layer supplied one.
+ *
+ * Returns `null` when absent or malformed — the session then reports null
+ * adoption rather than a fabricated 0.
+ */
+export function resolveRoutingRecommendation(
+	env: NodeJS.ProcessEnv = process.env,
+): RoutingRecommendation | null {
+	const layer = env.AUTOMATION_METRICS_ROUTING_LAYER;
+	if (typeof layer !== "string" || !ROUTING_LAYER_VALUES.has(layer)) {
+		return null;
+	}
+	const rawConfidence = Number(env.AUTOMATION_METRICS_ROUTING_CONFIDENCE);
+	return {
+		recommendedLayer: layer as RoutingRecommendation["recommendedLayer"],
+		recommendedTool: env.AUTOMATION_METRICS_ROUTING_TOOL || null,
+		taskType: env.AUTOMATION_METRICS_ROUTING_TASK_TYPE || "unspecified",
+		confidence:
+			Number.isFinite(rawConfidence) &&
+			rawConfidence >= 0 &&
+			rawConfidence <= 1
+				? rawConfidence
+				: 0.5,
+	};
 }
 
 // --- Pi Runtime Introspection ---
@@ -586,11 +693,25 @@ export function summaryMetadata(
 			user_interruptions: null,
 			user_response_times: null,
 
-			// --- Routing adoption (F-010 populates; null until then) ---
-			routing_signals_injected: 0,
-			routing_candidates_available: null,
-			routing_candidates_matched: null,
-			routing_adoption_rate: null,
+			// --- Routing adoption (v2.14) ---
+			// Null rather than 0 when no routing signal existed: an absent
+			// denominator is not a 0% adoption rate.
+			routing_signals_injected: state.routingAvailable,
+			routing_candidates_available:
+				state.routingAvailable > 0 ? state.routingAvailable : null,
+			routing_candidates_matched:
+				state.routingAvailable > 0 ? state.routingMatched : null,
+			routing_adoption_rate:
+				state.routingAvailable > 0
+					? Math.round(
+							(state.routingMatched / state.routingAvailable) *
+								1000,
+						) / 1000
+					: null,
+
+			// --- Task ownership diagnostics (F-010) ---
+			task_context_source: state.task.source,
+			boundary_events_emitted: state.boundaryEventsEmitted,
 		},
 	};
 }
@@ -649,6 +770,37 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
+	/**
+	 * Emit a task ownership transition.
+	 *
+	 * No-ops when task context is unresolved. Inventing an id here would
+	 * produce ownership records that never correlate with Claude Code.
+	 */
+	function boundary(
+		action: "claim" | "handoff" | "suspend" | "resume" | "release",
+		fromHarness: Harness | null,
+		toHarness: Harness | null,
+		reason: string,
+	): void {
+		if (!state.task.taskId) return;
+
+		send({
+			...commonFields(),
+			layer: "orchestration",
+			event_type: "task_boundary",
+			command: action,
+			metadata: {
+				task_id: state.task.taskId,
+				boundary_action: action,
+				from_harness: fromHarness,
+				to_harness: toHarness,
+				reason,
+				concurrent_billing_risk: billingRisk(fromHarness),
+			},
+		});
+		state.boundaryEventsEmitted++;
+	}
+
 	pi.on("session_start", async (_event, ctx) => {
 		state = freshState();
 
@@ -660,7 +812,20 @@ export default function (pi: ExtensionAPI) {
 		if (header.sessionFile) state.sessionFile = header.sessionFile;
 		if (header.cwd) state.cwd = header.cwd;
 
+		// Resolved once per session: the dispatch directory is on the
+		// filesystem and must not be touched from the hot tool path.
+		state.task = resolveTaskContext({ cwd: state.cwd });
+
 		lifecycle("agent_start");
+
+		// An inbound from_harness means another harness owned this task and is
+		// handing it over; otherwise Pi is claiming it fresh.
+		const inbound = resolveInboundHarness();
+		if (inbound && inbound !== "pi") {
+			boundary("handoff", inbound, "pi", "inbound_harness_handoff");
+		} else {
+			boundary("claim", null, "pi", "session_start");
+		}
 	});
 
 	pi.on("tool_call", async (event, _ctx) => {
@@ -685,6 +850,11 @@ export default function (pi: ExtensionAPI) {
 
 		state.toolDistribution[toolName] =
 			(state.toolDistribution[toolName] || 0) + 1;
+
+		// Evidence for layer-routing inference at shutdown.
+		if (toolName === "bash" && fw) {
+			state.bashFirstWords[fw] = (state.bashFirstWords[fw] || 0) + 1;
+		}
 
 		// Enrichment signals derived from the invocation itself.
 		if (typeof toolName === "string") {
@@ -845,8 +1015,52 @@ export default function (pi: ExtensionAPI) {
 		});
 	});
 
-	pi.on("session_shutdown", async (_event, _ctx) => {
+	pi.on("session_shutdown", async (event, _ctx) => {
 		lifecycle("agent_end");
+
+		// A shutdown carrying an error or a non-clean reason suspends the task
+		// rather than releasing it: consumers age out stale claims, but a
+		// premature release would hide an abandoned task.
+		const reason = (event as { reason?: unknown } | null)?.reason;
+		const errored = Boolean(
+			(event as { error?: unknown } | null)?.error ||
+				(typeof reason === "string" &&
+					/error|crash|abort|interrupt|signal/i.test(reason)),
+		);
+
+		if (errored) {
+			boundary("suspend", "pi", null, "abnormal_shutdown");
+		} else {
+			boundary("release", "pi", null, "session_complete");
+		}
+
+		// Layer routing: emitted only when the hook layer injected a
+		// recommendation. Absent one, adoption reports null rather than 0.
+		const recommendation = resolveRoutingRecommendation();
+		if (recommendation) {
+			const actual = inferActualLayer(state.bashFirstWords);
+			const matched = actual === recommendation.recommendedLayer;
+			state.routingAvailable++;
+			if (matched) state.routingMatched++;
+
+			send({
+				...commonFields(),
+				layer: "topology",
+				event_type: "layer_routing_decision",
+				command: "layer_routing",
+				metadata: {
+					recommended_layer: recommendation.recommendedLayer,
+					recommended_tool: recommendation.recommendedTool,
+					actual_layer: actual,
+					confidence: recommendation.confidence,
+					task_type: recommendation.taskType,
+					override: !matched,
+					override_reason: matched ? null : "other",
+					session_id_ref: state.sessionId,
+					baseline_layer: null,
+				},
+			});
+		}
 
 		const { durationMs, metadata } = summaryMetadata(state);
 
