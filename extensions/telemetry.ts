@@ -83,6 +83,7 @@ export function emit(
 	event: Record<string, unknown>,
 	opts: EmitOptions = {},
 ): void {
+	if (telemetryDisabled()) return;
 	try {
 		const dir = resolveEventsDir(opts.dir);
 		if (!existsSync(dir)) {
@@ -116,6 +117,9 @@ export function emitChecked(
 	stats: DropStats,
 	opts: EmitOptions = {},
 ): boolean {
+	// Short-circuit before validation so the kill switch also removes the
+	// validation cost, not just the write.
+	if (telemetryDisabled()) return false;
 	const now = opts.now ?? new Date();
 	const result = validateEvent(buildRecord(event, now));
 
@@ -136,6 +140,20 @@ export function emitChecked(
 
 export function resolveAgent(): string | null {
 	return process.env.AUTOMATION_METRICS_AGENT || null;
+}
+
+/**
+ * Operator kill switch.
+ *
+ * Set `AUTOMATION_METRICS_DISABLED=1` to suppress all emission. Checked at
+ * call time, not import time, so it can be flipped for a single session
+ * without reinstalling the package.
+ */
+export function telemetryDisabled(
+	env: NodeJS.ProcessEnv = process.env,
+): boolean {
+	const v = env.AUTOMATION_METRICS_DISABLED;
+	return v === "1" || v === "true" || v === "yes";
 }
 
 /**
@@ -230,8 +248,16 @@ export function classifyError(toolName: string, result: unknown): string {
 	return "unknown";
 }
 
+/**
+ * Bounded, redacted error text for `tool_failure`.
+ *
+ * Redaction is NOT optional here. Tool errors are one of the likeliest places
+ * for a credential to surface verbatim - a failed curl, a rejected git push,
+ * an auth error echoing the token it just tried. This previously wrote raw
+ * tool output straight to the bus.
+ */
 export function errorMessage(result: unknown): string {
-	return contentText(result).slice(0, 200);
+	return redact(contentText(result)).slice(0, 200);
 }
 
 // --- Session State ---
@@ -557,7 +583,7 @@ export interface TurnUsage {
 }
 
 /** Aggregate token usage across the assistant messages of one agent_end turn. */
-export function aggregateTurnUsage(messages: readonly unknown[]): TurnUsage {
+export function aggregateTurnUsage(messages: unknown): TurnUsage {
 	const usage: TurnUsage = {
 		input: 0,
 		output: 0,
@@ -565,12 +591,18 @@ export function aggregateTurnUsage(messages: readonly unknown[]): TurnUsage {
 		cacheWrite: 0,
 		turns: 0,
 	};
+	// Pi payload shapes vary across versions; a non-array `messages` must not
+	// throw inside a lifecycle hook.
+	if (!Array.isArray(messages)) return usage;
 	for (const message of messages) {
 		if (!isAssistantMessage(message)) continue;
-		usage.input += message.usage.input || 0;
-		usage.output += message.usage.output || 0;
-		usage.cacheRead += message.usage.cacheRead || 0;
-		usage.cacheWrite += message.usage.cacheWrite || 0;
+		const u = (message as { usage?: unknown }).usage;
+		if (!u || typeof u !== "object") continue;
+		const m = u as Record<string, unknown>;
+		usage.input += Number(m.input) || 0;
+		usage.output += Number(m.output) || 0;
+		usage.cacheRead += Number(m.cacheRead) || 0;
+		usage.cacheWrite += Number(m.cacheWrite) || 0;
 		usage.turns++;
 	}
 	return usage;
@@ -742,6 +774,33 @@ export function approvalRate(state: SessionState): number | null {
 export default function (pi: ExtensionAPI) {
 	let state = freshState();
 
+	/**
+	 * Hook boundary guard (RG-5).
+	 *
+	 * Telemetry must never propagate an exception into the Pi harness it
+	 * observes. Pi payload shapes vary across versions, and a malformed or
+	 * hostile event should cost us one lost record - not the agent's session.
+	 *
+	 * One guard at the boundary rather than defensive checks scattered through
+	 * every handler: it cannot be forgotten when a new hook is added.
+	 */
+	function guard(
+		name: string,
+		handler: (event: any, ctx: unknown) => Promise<void> | void,
+	) {
+		return async (event: any, ctx: unknown) => {
+			try {
+				await handler(event ?? {}, ctx);
+			} catch {
+				// Count it so a systematically failing hook is visible in the
+				// session summary rather than silently dropping data.
+				state.droppedEvents++;
+				state.dropReasons[`hook_error:${name}`] =
+					(state.dropReasons[`hook_error:${name}`] ?? 0) + 1;
+			}
+		};
+	}
+
 	function commonFields(): Record<string, unknown> {
 		return {
 			layer: "claude_code",
@@ -822,7 +881,7 @@ export default function (pi: ExtensionAPI) {
 		state.boundaryEventsEmitted++;
 	}
 
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", guard("session_start", async (event, ctx) => {
 		state = freshState();
 
 		// Adopt Pi's own session identity when the runtime exposes it, so Pi
@@ -847,9 +906,9 @@ export default function (pi: ExtensionAPI) {
 		} else {
 			boundary("claim", null, "pi", "session_start");
 		}
-	});
+	}));
 
-	pi.on("tool_call", async (event, _ctx) => {
+	pi.on("tool_call", guard("tool_call", async (event, ctx) => {
 		const toolName = event.toolName;
 		const fw =
 			toolName === "bash"
@@ -908,9 +967,9 @@ export default function (pi: ExtensionAPI) {
 			toolName,
 			toolUseId,
 		});
-	});
+	}));
 
-	pi.on("tool_result", async (event, _ctx) => {
+	pi.on("tool_result", guard("tool_result", async (event, ctx) => {
 		const toolName = event.toolName;
 		const fw =
 			toolName === "bash"
@@ -962,9 +1021,9 @@ export default function (pi: ExtensionAPI) {
 			toolName,
 			toolUseId: event.toolCallId || "",
 		});
-	});
+	}));
 
-	pi.on("agent_end", async (event, _ctx) => {
+	pi.on("agent_end", guard("agent_end", async (event, ctx) => {
 		state.promptCount++;
 
 		const {
@@ -1022,9 +1081,9 @@ export default function (pi: ExtensionAPI) {
 				},
 			});
 		}
-	});
+	}));
 
-	pi.on("model_select", async (event, _ctx) => {
+	pi.on("model_select", guard("model_select", async (event, ctx) => {
 		const modelId =
 			typeof event.model === "object" && event.model !== null
 				? (event.model as { id?: string }).id || "unknown"
@@ -1049,9 +1108,9 @@ export default function (pi: ExtensionAPI) {
 				baseline_model: null,
 			},
 		});
-	});
+	}));
 
-	pi.on("session_shutdown", async (event, _ctx) => {
+	pi.on("session_shutdown", guard("session_shutdown", async (event, ctx) => {
 		lifecycle("agent_end");
 
 		// A shutdown carrying an error or a non-clean reason suspends the task
@@ -1107,5 +1166,5 @@ export default function (pi: ExtensionAPI) {
 			duration_ms: durationMs,
 			metadata,
 		});
-	});
+	}));
 }
