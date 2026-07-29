@@ -16,7 +16,27 @@
  * in the same commit.
  */
 
+/**
+ * Contract version of the canonical schema document.
+ *
+ * NOTE the two conventions in play, verified against the live bus:
+ *   - `core/schemas/event-schema.yaml` declares `version: "2.14"` (document)
+ *   - `emit_jsonl` writes `"schema_version":"2"` on every event, and all
+ *     2,829 events currently on the bus use `"2"` (major only)
+ *   - pi-telemetry v1.0 shipped emitting `"2.14"`
+ *
+ * Both are therefore valid in the wild. Validation compares MAJOR versions so
+ * a minor bump (2.14 -> 2.15, which only ever adds optional fields) does not
+ * invalidate every historical event or every fish-emitted event.
+ */
 export const SCHEMA_VERSION = "2.14";
+
+/** Major component of a schema version string: "2.14" -> "2", "2" -> "2". */
+export function majorVersion(v: string): string {
+	return v.split(".")[0];
+}
+
+export const SCHEMA_MAJOR = majorVersion(SCHEMA_VERSION);
 
 /** Layer vocabulary from the canonical schema's `layers:` block. */
 export const LAYERS = [
@@ -46,6 +66,13 @@ export interface FieldRule {
 	kind: FieldKind;
 	/** Permitted values. `null` is allowed independently via `*_or_null` kinds. */
 	enum?: readonly string[];
+	/**
+	 * Whether the KEY must be present. Defaults to true.
+	 *
+	 * Distinct from nullability: a field may be required-but-nullable, meaning
+	 * the key must exist and may hold null.
+	 */
+	required?: boolean;
 }
 
 export interface EventRule {
@@ -106,23 +133,37 @@ export const TASK_CATEGORIES = [
 // --- Common field contract ---------------------------------------------------
 
 /**
- * Fields required on every event regardless of type.
+ * Common fields, mirroring the canonical schema's `common_fields:` block.
  *
- * `agent` is `string_or_null`: the canonical schema permits a null agent when
- * AUTOMATION_METRICS_AGENT is unset, but the KEY must be present so consumers
- * can distinguish "unattributed" from "field forgotten".
+ * Only `timestamp`, `layer`, `event_type`, and `command` are marked
+ * `required: true` there. Everything else is optional or nullable — including
+ * `harness` and `agent_runtime`, which were added in v2.9 as OPTIONAL fields
+ * (Registry EPIC-162 M2) precisely so pre-existing writers stay valid.
+ *
+ * An earlier revision of this table required harness/agent_runtime/session_id/
+ * cwd and omitted `command` entirely. That would have rejected all 2,829
+ * events currently on the bus, every future fish-emitted event, and the whole
+ * Herdr observer surface — while silently tolerating a missing `command`.
+ *
+ * This validator checks CANONICAL validity. Requirements specific to this
+ * package (pi harness identity on every emission) are asserted separately by
+ * RG-1, which is the correct place for package policy.
  */
 export const COMMON_FIELDS: Record<string, FieldRule> = {
-	schema_version: { kind: "string" },
+	// required: true in the canonical schema
 	timestamp: { kind: "string" },
 	event_type: { kind: "string" },
 	layer: { kind: "string", enum: LAYERS },
-	session_id: { kind: "string" },
-	agent: { kind: "string_or_null" },
-	cwd: { kind: "string" },
-	harness: { kind: "string", enum: HARNESSES },
-	agent_runtime: { kind: "string" },
-	metadata: { kind: "object" },
+	command: { kind: "string" },
+
+	// present in the canonical envelope but optional / nullable
+	schema_version: { kind: "string", required: false },
+	session_id: { kind: "string_or_null", required: false },
+	agent: { kind: "string_or_null", required: false },
+	cwd: { kind: "string_or_null", required: false },
+	harness: { kind: "string_or_null", enum: HARNESSES, required: false },
+	agent_runtime: { kind: "string_or_null", required: false },
+	metadata: { kind: "object", required: false },
 };
 
 /** Compact UTC form used across the bus: YYYYMMDDTHHMMSSZ. */

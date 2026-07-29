@@ -13,8 +13,10 @@ import {
 	COMMON_FIELDS,
 	EVENT_RULES,
 	KNOWN_EVENT_TYPES,
+	SCHEMA_MAJOR,
 	SCHEMA_VERSION,
 	TIMESTAMP_PATTERN,
+	majorVersion,
 	type FieldRule,
 } from "./eventSchema.ts";
 
@@ -139,26 +141,32 @@ export function validateEvent(event: unknown): ValidationResult {
 		// 1. Common fields: presence + type + enum.
 		for (const [name, rule] of Object.entries(COMMON_FIELDS)) {
 			if (!Object.hasOwn(e, name)) {
-				issues.push({
-					field: name,
-					code: "missing_required",
-					detail: `required field '${name}' absent`,
-				});
+				if (rule.required !== false) {
+					issues.push({
+						field: name,
+						code: "missing_required",
+						detail: `required field '${name}' absent`,
+					});
+				}
 				continue;
 			}
 			checkField(name, e[name], rule, issues);
 		}
 
-		// 2. Schema version must match the vendored snapshot exactly.
-		if (
-			typeof e.schema_version === "string" &&
-			e.schema_version !== SCHEMA_VERSION
-		) {
-			issues.push({
-				field: "schema_version",
-				code: "schema_version_mismatch",
-				detail: `got '${e.schema_version}', expected '${SCHEMA_VERSION}'`,
-			});
+		// 2. Schema version: compare MAJOR only.
+		//
+		// The bus carries "2" (emit_jsonl) and "2.14" (pi-telemetry). Minor
+		// revisions only add optional fields, so an exact-match rule would
+		// reject every historical and fish-emitted event for no benefit.
+		if (typeof e.schema_version === "string") {
+			const got = majorVersion(e.schema_version);
+			if (got !== SCHEMA_MAJOR) {
+				issues.push({
+					field: "schema_version",
+					code: "schema_version_mismatch",
+					detail: `major version '${got}' is incompatible with '${SCHEMA_MAJOR}' (from '${e.schema_version}', snapshot '${SCHEMA_VERSION}')`,
+				});
+			}
 		}
 
 		// 3. Timestamp shape.
@@ -173,9 +181,10 @@ export function validateEvent(event: unknown): ValidationResult {
 			});
 		}
 
-		// 4. Non-empty string invariants. Empty session_id/cwd defeat
-		//    correlation, so they are rejected rather than passed through.
-		for (const name of ["session_id", "cwd", "agent_runtime"]) {
+		// 4. Non-empty invariants for fields that exist. An empty session_id or
+		//    cwd defeats correlation, so a present-but-blank value is rejected
+		//    even though the field itself is optional.
+		for (const name of ["session_id", "cwd", "agent_runtime", "command"]) {
 			if (typeof e[name] === "string" && e[name] === "") {
 				issues.push({
 					field: name,
@@ -210,6 +219,17 @@ export function validateEvent(event: unknown): ValidationResult {
 		}
 
 		// 7. Per-type metadata contract.
+		//
+		// Metadata keys are validated for TYPE and ENUM when present, but their
+		// presence is not mandated. The canonical schema documents 48
+		// metadata_fields blocks and marks exactly one field `required`, so the
+		// block describes the shape a field takes rather than a set every
+		// producer must supply.
+		//
+		// Enforcing presence here rejected 285 of 298 real bus events —
+		// including every Claude Code `tool_use`, which omits `first_word`.
+		// Completeness of THIS package's own emissions is package policy and is
+		// asserted by RG-1 instead.
 		if (rule.metadata) {
 			const meta = e.metadata;
 			if (
@@ -219,16 +239,8 @@ export function validateEvent(event: unknown): ValidationResult {
 			) {
 				const m = meta as Record<string, unknown>;
 				for (const [name, fieldRule] of Object.entries(rule.metadata)) {
-					const path = `metadata.${name}`;
-					if (!Object.hasOwn(m, name)) {
-						issues.push({
-							field: path,
-							code: "missing_required",
-							detail: `required field '${path}' absent`,
-						});
-						continue;
-					}
-					checkField(path, m[name], fieldRule, issues);
+					if (!Object.hasOwn(m, name)) continue;
+					checkField(`metadata.${name}`, m[name], fieldRule, issues);
 				}
 			}
 			// A non-object `metadata` was already reported by the common-field

@@ -22,17 +22,33 @@ describe("F-007 contract tests", () => {
 		expect(result.valid).toBe(true);
 	});
 
-	it("CT-2: missing session_id yields missing_required", () => {
-		const e = validEvent("session_summary");
-		delete e.session_id;
-		expect(codes(e)).toContain("missing_required");
-		expect(validateEvent(e).valid).toBe(false);
+	it("CT-2: a present-but-empty session_id is rejected", () => {
+		// session_id is optional upstream, so absence is tolerated — but an
+		// empty string defeats correlation and is treated as a defect.
+		const absent = validEvent("session_summary");
+		delete absent.session_id;
+		expect(validateEvent(absent).valid).toBe(true);
+
+		const blank = validEvent("session_summary");
+		blank.session_id = "";
+		expect(codes(blank)).toContain("missing_required");
+		expect(validateEvent(blank).valid).toBe(false);
 	});
 
-	it("CT-3: schema_version 2.13 yields schema_version_mismatch", () => {
+	it("CT-3: an incompatible MAJOR version yields schema_version_mismatch", () => {
 		const e = validEvent("session_summary");
-		e.schema_version = "2.13";
+		e.schema_version = "3.0";
 		expect(codes(e)).toContain("schema_version_mismatch");
+	});
+
+	it("CT-3b: minor revisions within major 2 are accepted", () => {
+		// The bus carries "2" from emit_jsonl and "2.14" from this package.
+		// Both must validate, or every historical event becomes invalid.
+		for (const v of ["2", "2.9", "2.14", "2.15"]) {
+			const e = validEvent("session_summary");
+			e.schema_version = v;
+			expect(validateEvent(e).valid, v).toBe(true);
+		}
 	});
 
 	it("CT-4: unknown event_type yields unknown_event_type", () => {
@@ -53,20 +69,40 @@ describe("F-007 contract tests", () => {
 		).toBe(true);
 	});
 
-	it("CT-6: agent null is valid; absent agent is invalid", () => {
+	it("CT-6: agent may be null OR absent (optional in the canonical schema)", () => {
 		const withNull = validEvent("session_summary");
 		withNull.agent = null;
 		expect(validateEvent(withNull).valid).toBe(true);
 
+		// `agent` is string_or_null and NOT marked required:true upstream.
+		// Rejecting its absence would invalidate every interactive-shell event
+		// on the bus.
 		const absent = validEvent("session_summary");
 		delete absent.agent;
-		const result = validateEvent(absent);
-		expect(result.valid).toBe(false);
-		expect(
-			result.issues.some(
-				(i) => i.field === "agent" && i.code === "missing_required",
-			),
-		).toBe(true);
+		expect(validateEvent(absent).valid).toBe(true);
+	});
+
+	it("CT-6b: the four upstream-required fields are enforced", () => {
+		for (const field of ["timestamp", "event_type", "layer", "command"]) {
+			const e = validEvent("session_summary");
+			delete e[field];
+			const result = validateEvent(e);
+			expect(result.valid, field).toBe(false);
+			expect(
+				result.issues.some((i) => i.field === field),
+				field,
+			).toBe(true);
+		}
+	});
+
+	it("CT-6c: optional envelope fields may be omitted entirely", () => {
+		// A fish-emitted event carries no harness/agent_runtime. It must still
+		// validate — those fields were added in v2.9 as optional.
+		const e = validEvent("workspace_idle");
+		delete e.harness;
+		delete e.agent_runtime;
+		e.schema_version = "2";
+		expect(validateEvent(e).issues).toEqual([]);
 	});
 
 	it("CT-7: non-object metadata yields type_mismatch", () => {
@@ -151,13 +187,23 @@ describe("F-007 field rules", () => {
 		expect(codes(e)).toContain("missing_required");
 	});
 
-	it("rejects a missing required metadata key", () => {
-		const e = validEvent("dispatch_abandoned");
-		delete (e.metadata as Record<string, unknown>).claimed_sentinel;
-		const result = validateEvent(e);
+	it("tolerates a missing metadata key but still type-checks present ones", () => {
+		// Presence is not mandated — the canonical schema documents metadata
+		// shape, it does not require every producer to supply every field.
+		const absent = validEvent("dispatch_abandoned");
+		delete (absent.metadata as Record<string, unknown>).claimed_sentinel;
+		expect(validateEvent(absent).valid).toBe(true);
+
+		// But a present field of the wrong type is still a defect.
+		const wrong = validEvent("dispatch_abandoned");
+		(wrong.metadata as Record<string, unknown>).claimed_sentinel = 42;
+		const result = validateEvent(wrong);
+		expect(result.valid).toBe(false);
 		expect(
 			result.issues.some(
-				(i) => i.field === "metadata.claimed_sentinel",
+				(i) =>
+					i.field === "metadata.claimed_sentinel" &&
+					i.code === "type_mismatch",
 			),
 		).toBe(true);
 	});

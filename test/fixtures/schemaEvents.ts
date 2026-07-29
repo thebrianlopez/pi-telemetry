@@ -24,6 +24,7 @@ export function envelope(overrides: Record<string, unknown> = {}) {
 export const VALID_EVENTS: Record<string, Record<string, unknown>> = {
 	agent_lifecycle: envelope({
 		event_type: "agent_lifecycle",
+		command: "agent_lifecycle",
 		layer: "orchestration",
 		metadata: {
 			pi_event_type: "agent_start",
@@ -34,6 +35,7 @@ export const VALID_EVENTS: Record<string, Record<string, unknown>> = {
 
 	task_boundary: envelope({
 		event_type: "task_boundary",
+		command: "task_boundary",
 		layer: "orchestration",
 		metadata: {
 			task_id: "EPIC-251-M1",
@@ -47,6 +49,7 @@ export const VALID_EVENTS: Record<string, Record<string, unknown>> = {
 
 	model_routing_decision: envelope({
 		event_type: "model_routing_decision",
+		command: "model_routing_decision",
 		layer: "orchestration",
 		metadata: {
 			classification: "model_switch",
@@ -60,6 +63,7 @@ export const VALID_EVENTS: Record<string, Record<string, unknown>> = {
 
 	prompt_submit: envelope({
 		event_type: "prompt_submit",
+		command: "prompt_submit",
 		layer: "cloud_llm",
 		metadata: {
 			input_tokens: 1200,
@@ -69,6 +73,7 @@ export const VALID_EVENTS: Record<string, Record<string, unknown>> = {
 
 	tool_use: envelope({
 		event_type: "tool_use",
+		command: "tool_use",
 		layer: "claude_code",
 		metadata: {
 			tool_name: "bash",
@@ -79,6 +84,7 @@ export const VALID_EVENTS: Record<string, Record<string, unknown>> = {
 
 	tool_result: envelope({
 		event_type: "tool_result",
+		command: "tool_result",
 		layer: "claude_code",
 		metadata: {
 			tool_name: "bash",
@@ -93,6 +99,7 @@ export const VALID_EVENTS: Record<string, Record<string, unknown>> = {
 
 	tool_failure: envelope({
 		event_type: "tool_failure",
+		command: "tool_failure",
 		layer: "claude_code",
 		metadata: {
 			tool_name: "bash",
@@ -104,6 +111,7 @@ export const VALID_EVENTS: Record<string, Record<string, unknown>> = {
 
 	session_summary: envelope({
 		event_type: "session_summary",
+		command: "session_summary",
 		layer: "claude_code",
 		metadata: {
 			tool_events: 3,
@@ -120,6 +128,7 @@ export const VALID_EVENTS: Record<string, Record<string, unknown>> = {
 
 	layer_routing_decision: envelope({
 		event_type: "layer_routing_decision",
+		command: "layer_routing_decision",
 		layer: "topology",
 		metadata: {
 			recommended_layer: "go_cli",
@@ -132,6 +141,7 @@ export const VALID_EVENTS: Record<string, Record<string, unknown>> = {
 
 	pi_session_complete: envelope({
 		event_type: "pi_session_complete",
+		command: "pi_session_complete",
 		layer: "fish",
 		metadata: {
 			workspace_id: "w1",
@@ -142,6 +152,7 @@ export const VALID_EVENTS: Record<string, Record<string, unknown>> = {
 
 	dispatch_abandoned: envelope({
 		event_type: "dispatch_abandoned",
+		command: "dispatch_abandoned",
 		layer: "fish",
 		metadata: {
 			workspace_id: "w1",
@@ -155,6 +166,7 @@ export const VALID_EVENTS: Record<string, Record<string, unknown>> = {
 
 	workspace_idle: envelope({
 		event_type: "workspace_idle",
+		command: "workspace_idle",
 		layer: "fish",
 		metadata: {
 			workspace_id: "w1",
@@ -164,6 +176,7 @@ export const VALID_EVENTS: Record<string, Record<string, unknown>> = {
 
 	agent_status_stalled: envelope({
 		event_type: "agent_status_stalled",
+		command: "agent_status_stalled",
 		layer: "fish",
 		metadata: {
 			workspace_id: "w1",
