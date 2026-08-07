@@ -12,6 +12,7 @@ import { join } from "node:path";
 import telemetry, {
 	aggregateTurnUsage,
 	classifyError,
+	contentPlaneFields,
 	contentText,
 	dateFileName,
 	emit,
@@ -22,6 +23,7 @@ import telemetry, {
 	opusPct,
 	resolveAgent,
 	resolveEventsDir,
+	resolveFilePath,
 	summaryMetadata,
 	SCHEMA_VERSION,
 	type SessionState,
@@ -31,6 +33,7 @@ import {
 	assistantMessage,
 	bashToolCall,
 	bashToolResult,
+	fileToolCall,
 	userMessage,
 } from "./fixtures/events.ts";
 
@@ -236,6 +239,48 @@ describe("F8 session lifecycle", () => {
 
 // --- F9: Tool events ---------------------------------------------------------
 
+describe("content plane", () => {
+	it("resolves path, file_path, and notebook_path in precedence order", () => {
+		expect(resolveFilePath({ path: "a" })).toBe("a");
+		expect(resolveFilePath({ file_path: "b" })).toBe("b");
+		expect(resolveFilePath({ notebook_path: "c" })).toBe("c");
+		expect(resolveFilePath({ path: "a", file_path: "b" })).toBe("a");
+	});
+
+	it("returns null for non-file inputs", () => {
+		expect(resolveFilePath({ command: "ls" })).toBeNull();
+		expect(resolveFilePath({ path: "" })).toBeNull();
+		expect(resolveFilePath(null)).toBeNull();
+		expect(resolveFilePath("nope")).toBeNull();
+	});
+
+	it("never emits file contents, only a hash and a length", () => {
+		const secret = "AKIAIOSFODNN7EXAMPLE";
+		const f = contentPlaneFields({ path: "/tmp/a", content: secret });
+		expect(JSON.stringify(f)).not.toContain(secret);
+		expect(f.content_length).toBe(secret.length);
+		expect(f.content_hash).toMatch(/^sha256:/);
+	});
+
+	it("suppresses the hash under capture mode off but keeps the path", () => {
+		const f = contentPlaneFields({ path: "/tmp/a", content: "x" }, "off");
+		expect(f.file_path).toBe("/tmp/a");
+		expect(f.content_hash).toBeUndefined();
+		expect(f.content_length).toBe(1);
+	});
+
+	it("hashes new_string in preference to content", () => {
+		const f = contentPlaneFields({
+			path: "/tmp/a",
+			new_string: "post",
+			content: "other",
+		});
+		expect(f.content_hash).toBe(
+			contentPlaneFields({ path: "/tmp/a", content: "post" }).content_hash,
+		);
+	});
+});
+
 describe("F9 tool events", () => {
 	it("tool_call emits tool_use with the bash first_word", async () => {
 		const fire = mountExtension();
@@ -244,6 +289,33 @@ describe("F9 tool events", () => {
 		const [event] = eventsOfType("tool_use");
 		expect(event).toBeDefined();
 		expect(event.metadata.first_word).toBe("git");
+	});
+
+	it("tool_use carries file_path and a content hash for edits", async () => {
+		const fire = mountExtension();
+		await fire("session_start");
+		await fire(
+			"tool_call",
+			fileToolCall("edit", {
+				path: "/tmp/x/a.ts",
+				old_string: "before",
+				new_string: "after",
+			}),
+		);
+		const [event] = eventsOfType("tool_use");
+		expect(event.metadata.file_path).toBe("/tmp/x/a.ts");
+		expect(event.metadata.content_hash).toMatch(/^sha256:[0-9a-f]{64}$/);
+		expect(event.metadata.content_length).toBe(5);
+	});
+
+	it("tool_use omits content-plane fields for non-file tools", async () => {
+		const fire = mountExtension();
+		await fire("session_start");
+		await fire("tool_call", bashToolCall("git status"));
+		const [event] = eventsOfType("tool_use");
+		expect(event.metadata.first_word).toBe("git");
+		expect(event.metadata).not.toHaveProperty("file_path");
+		expect(event.metadata).not.toHaveProperty("content_hash");
 	});
 
 	it("tool_result emits tool_result on the success path", async () => {

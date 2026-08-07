@@ -656,6 +656,70 @@ export function isMutatingTool(toolName: unknown): boolean {
 	);
 }
 
+// --- Content Plane ---
+
+/**
+ * Tool-input keys that carry a target file path, in precedence order.
+ *
+ * Pi's own tools use `path`; `file_path` and `notebook_path` are accepted so
+ * that Claude-Code-shaped inputs replayed through the Pi harness resolve
+ * identically rather than silently dropping to null.
+ */
+const PATH_KEYS = ["path", "file_path", "notebook_path"] as const;
+
+/**
+ * Extract the target path from a tool invocation.
+ *
+ * Returns `null` for tools that do not act on a file (bash, web_search, the
+ * herdr_* family). Paths are emitted verbatim: they are already present in the
+ * `cwd` field and in `command`, so they leak nothing new, and hashing them
+ * would destroy the join key that makes the content plane useful.
+ */
+export function resolveFilePath(input: unknown): string | null {
+	if (!input || typeof input !== "object") return null;
+	const rec = input as Record<string, unknown>;
+	for (const key of PATH_KEYS) {
+		const v = rec[key];
+		if (typeof v === "string" && v.length > 0) return v;
+	}
+	return null;
+}
+
+/**
+ * Content-plane fields for one tool invocation.
+ *
+ * `file_path` answers "which file", `content_hash` answers "did it change" —
+ * together they let a bus event be joined to a VCS operation without the bus
+ * ever storing file contents. The hash covers the post-state (`new_string` /
+ * `content`), which is what a subsequent snapshot would record.
+ *
+ * Content is hashed, never previewed: unlike prompts, file bodies have no
+ * bounded excerpt that is safe by construction on a plaintext, unrotated,
+ * world-readable-by-default JSONL bus. `AUTOMATION_METRICS_PROMPT_CAPTURE=off`
+ * suppresses the hash too, so the existing operator control keeps working.
+ */
+export function contentPlaneFields(
+	input: unknown,
+	mode: PromptCapture = resolvePromptCapture(),
+): { file_path?: string; content_hash?: string; content_length?: number } {
+	const filePath = resolveFilePath(input);
+	if (filePath === null) return {};
+
+	const out: {
+		file_path?: string;
+		content_hash?: string;
+		content_length?: number;
+	} = { file_path: filePath };
+
+	const rec = input as Record<string, unknown>;
+	const body = rec.new_string ?? rec.content;
+	if (typeof body === "string") {
+		out.content_length = body.length;
+		if (mode !== "off" && body.length > 0) out.content_hash = sha256(body);
+	}
+	return out;
+}
+
 /** Share of turns routed to an Opus-class model, as a percentage. */
 export function opusPct(state: SessionState): number {
 	let opusTurns = 0;
@@ -927,6 +991,9 @@ export default function (pi: ExtensionAPI) {
 				tool_name: toolName,
 				source: "pi",
 				first_word: fw,
+				// Content plane. Absent for non-file tools, so this stays a
+				// zero-cost addition for the ~80% of events that are bash.
+				...contentPlaneFields(event.input),
 				// The canonical schema omits tool_use_id from tool_use and
 				// declares it only on tool_result, which leaves the pair
 				// joinable only by position. Emitting it here costs nothing,

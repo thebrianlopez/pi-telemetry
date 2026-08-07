@@ -26,6 +26,14 @@ export function bashToolCall(command: string, toolCallId = "tc-1") {
 	};
 }
 
+export function fileToolCall(
+	toolName: "edit" | "write" | "read",
+	input: Record<string, unknown>,
+	toolCallId = "tc-1",
+) {
+	return { type: "tool_call" as const, toolCallId, toolName, input };
+}
+
 export function bashToolResult(
 	command: string,
 	output: string,
