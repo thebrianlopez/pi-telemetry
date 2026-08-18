@@ -1,0 +1,13 @@
+CORRECTION (EPIC-013 M1, 20260818): the PRD trailer on this commit is wrong.
+
+Recorded:  PRD: PiCodingAgent Platform Integration (Track B, R4-R5)
+Correct:   PRD: PERSONAL_20260630T211800Z_Pi_Automation_Metrics_Telemetry_Extension_PRD.md (R1, R2)
+
+The cited PRD belongs to a different chain (FDD 20260522T121256Z, epic
+PERSONAL_20260522T122746Z_..._EPIC-001). The FDD and TDD trailers on this
+commit are correct and identify the true source chain,
+picodingagent_event_bus_telemetry.
+
+History is deliberately not rewritten; this note is the correction of
+record. Tracked in EPIC-013
+(PERSONAL_20260727T034724Z_AutomationMetrics_EPIC-013_pi_event_bus_telemetry_extension.md).
