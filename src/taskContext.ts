@@ -12,9 +12,22 @@
  *
  * Precedence (first match wins, per TDD F-010 §2):
  *   1. AUTOMATION_METRICS_TASK_ID   explicit operator override
- *   2. .claude-dispatch/*.json      dispatch trigger in the workspace
+ *   2. .claude-dispatch/*.md        dispatch trigger in the workspace
  *   3. AUTOMATION_METRICS_CHAIN_KEY chain-scoped work
  *   4. none                         no boundary event is emitted
+ *
+ * PRODUCER CONTRACT (seam). The only producer of dispatch triggers is
+ * `core/functions/dispatch_emit.fish`, which writes
+ *
+ *     $agent_cwd/.claude-dispatch/$task_id.md
+ *
+ * as YAML frontmatter (`---` … `---`) followed by a markdown body. This module
+ * previously filtered on `.endsWith(".json")` and parsed with `JSON.parse` —
+ * a hand-typed guess on both the extension AND the encoding that matched
+ * nothing the producer had ever written. It failed silently (absence, not
+ * error) for roughly three months. The literals below are exported so
+ * `test/schema/dispatchContract.test.ts` can assert them against the producer
+ * instead of trusting a second hand-typed copy.
  */
 
 import { existsSync, readFileSync, readdirSync } from "node:fs";
@@ -54,17 +67,67 @@ export function epicIdFrom(text: unknown): string | null {
 	return m ? `EPIC-${m[1]}` : null;
 }
 
-/** `"M1,M2,M5"` -> `["M1","M2","M5"]`; tolerates spaces and empties. */
+/**
+ * `"M1,M2,M5"` -> `["M1","M2","M5"]`; tolerates spaces and empties.
+ *
+ * Real frontmatter uses YAML inline-flow sequences (`milestones: [M1, M2]`,
+ * `milestones: []`), so the surrounding brackets and any quoting are stripped
+ * before splitting. Without this, `[M1]` parsed as the literal milestone
+ * `"[M1]"` and `composeTaskId` produced `EPIC-237-[M1]` — a wrong value rather
+ * than a missing one, which is worse.
+ */
 export function parseMilestones(value: unknown): string[] {
 	if (Array.isArray(value)) {
 		return value.filter((v): v is string => typeof v === "string");
 	}
 	if (typeof value !== "string") return [];
-	return value
+	const inner = /^\[(.*)\]$/s.exec(value.trim());
+	return (inner ? inner[1] : value)
 		.split(",")
-		.map((s) => s.trim())
+		.map((s) => s.trim().replace(/^["']|["']$/g, "").trim())
 		.filter(Boolean);
 }
+
+/**
+ * Extension written by `dispatch_emit.fish`. Exported for the seam test.
+ *
+ * `.json` is deliberately NOT accepted. See the note in `readTriggers`.
+ */
+export const DISPATCH_TRIGGER_EXT = ".md";
+
+/**
+ * Agent replies land in the same directory as `<task>.response.md` and carry
+ * no frontmatter. They are not triggers and must never be treated as one.
+ */
+export const DISPATCH_RESPONSE_SUFFIX = ".response.md";
+
+/** Frontmatter fence emitted by the producer, on the very first line. */
+export const FRONTMATTER_FENCE = "---";
+
+/**
+ * Minimal YAML-frontmatter reader: flat `key: value` scalars only.
+ *
+ * Returns `null` when the document does not open with a fence, which is the
+ * signal that a `.md` file in the dispatch directory is not a trigger.
+ * Deliberately not a YAML dependency — the producer emits a fixed, flat field
+ * list, and the seam test pins that shape.
+ */
+export function parseFrontmatter(src: string): Record<string, string> | null {
+	const lines = src.split(/\r?\n/);
+	if (lines[0]?.trim() !== FRONTMATTER_FENCE) return null;
+	const out: Record<string, string> = {};
+	for (let i = 1; i < lines.length; i++) {
+		const line = lines[i];
+		if (line.trim() === FRONTMATTER_FENCE) return out;
+		const m = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
+		if (m) out[m[1]] = m[2].trim().replace(/^["']|["']$/g, "");
+	}
+	// Unterminated frontmatter: keep what we read rather than losing the task.
+	return out;
+}
+
+/** Frontmatter `status:` values that mean the trigger is no longer up for grabs. */
+const UNAVAILABLE_STATUSES = new Set(["claimed", "complete", "completed"]);
 
 /**
  * Compose the canonical task id for a dispatch.
@@ -90,12 +153,38 @@ interface Trigger {
 	claimed: boolean;
 }
 
-/** Read and parse every dispatch trigger in a directory. Never throws. */
+/**
+ * Read and parse every dispatch trigger in a directory. Never throws.
+ *
+ * Why `.md` only, and not `.md` plus `.json`:
+ *
+ *   - There is exactly one producer, `dispatch_emit.fish`, and it writes `.md`
+ *     unconditionally. A `.json` branch here would be code with no producer:
+ *     a second unverifiable seam, maintained forever on the strength of a
+ *     guess. That is the thing this change exists to remove.
+ *   - The two formats do not share a parse. Widening the filter alone would
+ *     hand YAML frontmatter to `JSON.parse`, which throws, which lands in the
+ *     degrade-to-filename branch below — recovering the epic but silently
+ *     dropping `milestones`. The task id would then be `EPIC-237` where it
+ *     should be `EPIC-237-M1`: a wrong value, not a missing one.
+ *   - Accepting both also destroys testability of the seam. If either
+ *     extension "works", no test can detect that the producer moved, and we
+ *     are back where we started.
+ *
+ * Residual risk, stated plainly: a trigger written before 2026-05-28 in a
+ * long-dormant workspace would be ignored. A read-only sweep of all 42
+ * `.claude-dispatch/` directories on this machine found 51 `.md` triggers and
+ * zero `.json`, so the live exposure is nil.
+ */
 export function readTriggers(dispatchDir: string): Trigger[] {
 	let names: string[];
 	try {
 		if (!existsSync(dispatchDir)) return [];
-		names = readdirSync(dispatchDir).filter((n) => n.endsWith(".json"));
+		names = readdirSync(dispatchDir).filter(
+			(n) =>
+				n.endsWith(DISPATCH_TRIGGER_EXT) &&
+				!n.endsWith(DISPATCH_RESPONSE_SUFFIX),
+		);
 	} catch {
 		return [];
 	}
@@ -104,18 +193,22 @@ export function readTriggers(dispatchDir: string): Trigger[] {
 	for (const name of names.sort()) {
 		const file = join(dispatchDir, name);
 		try {
-			const parsed = JSON.parse(readFileSync(file, "utf8")) as Record<
-				string,
-				unknown
-			>;
+			const parsed = parseFrontmatter(readFileSync(file, "utf8"));
+			// No opening fence: a stray markdown file, not a dispatch trigger.
+			// Skipping keeps `resolveTaskContext` from reporting
+			// `task_id_unresolvable` and suppressing the chain-key fallback.
+			if (!parsed) continue;
+			const status = (parsed.status ?? "").toLowerCase();
 			triggers.push({
 				file,
 				epic:
 					epicIdFrom(parsed.epic) ??
 					epicIdFrom(parsed.epic_path) ??
+					epicIdFrom(parsed.task) ??
 					epicIdFrom(name),
 				milestones: parseMilestones(parsed.milestones),
-				claimed: existsSync(`${file}.claimed`),
+				claimed:
+					existsSync(`${file}.claimed`) || UNAVAILABLE_STATUSES.has(status),
 			});
 		} catch {
 			// Unparseable body, but the filename still encodes the epic id.

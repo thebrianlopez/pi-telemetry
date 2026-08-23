@@ -5,10 +5,17 @@
  * `core/schemas/event-schema.yaml`, a file in a different repository. Nothing
  * prevents that source from advancing without this package noticing.
  *
- * This suite reads the canonical file WHEN PRESENT and fails on real drift.
- * When absent — CI, a fresh Alpine node, any machine without a `core` checkout
- * — it skips with a visible warning rather than failing, because the package
- * must remain buildable and testable without `core`.
+ * This suite reads the canonical file and fails on real drift.
+ *
+ * ABSENCE IS NOW A FAILURE. It used to `console.warn` and pass, which reported
+ * success for a check that never ran — the same false-confidence failure class
+ * this file exists to catch, applied to itself. A green suite must mean parity
+ * was verified.
+ *
+ * Environments that genuinely lack a `core` checkout (CI, a fresh Alpine box)
+ * opt out explicitly via `SEAM_CHECKS_UNVERIFIED_I_ACCEPT_DRIFT_RISK=1`. The
+ * name is deliberately alarming: seeing it in a CI config or a shell profile
+ * should read as a standing admission that schema drift is undetected there.
  */
 
 import { describe, expect, it } from "vitest";
@@ -24,6 +31,7 @@ import {
 	SCHEMA_VERSION,
 	majorVersion,
 } from "../../src/schema/eventSchema.ts";
+import { SEAM_OPT_OUT, seamChecksOptedOut } from "../seamOptOut.ts";
 
 /** Candidate locations for the canonical schema, most specific first. */
 const CANDIDATES = [
@@ -66,16 +74,32 @@ function canonicalLayers(src: string): string[] {
 
 describe("F-012 schema parity", () => {
 	if (!canonical) {
-		it("SKIPPED: canonical schema not present on this machine", () => {
-			// Deliberately not a failure. Surfaced loudly so a green suite on a
-			// machine without `core` is never mistaken for verified parity.
-			console.warn(
-				`\n  [parity] canonical schema not found. Looked in:\n` +
-					CANDIDATES.map((p) => `    - ${p}`).join("\n") +
-					`\n  Drift from core/schemas/event-schema.yaml is UNVERIFIED in this run.` +
-					`\n  Set AUTOMATION_METRICS_SCHEMA_PATH to check explicitly.\n`,
+		const where = CANDIDATES.map((p) => `    - ${p}`).join("\n");
+
+		if (seamChecksOptedOut()) {
+			it(`UNVERIFIED by opt-out (${SEAM_OPT_OUT})`, () => {
+				console.warn(
+					`\n  [parity] ${SEAM_OPT_OUT} is set. Parity against` +
+						`\n  core/schemas/event-schema.yaml was NOT checked in this run.` +
+						`\n  Looked in:\n${where}\n`,
+				);
+				expect(SCHEMA_VERSION).toMatch(/^\d+(\.\d+)?$/);
+			});
+			return;
+		}
+
+		it("canonical schema must be present for parity to be verifiable", () => {
+			// Hard failure by design. A skip here would report success for a
+			// comparison that never happened.
+			throw new Error(
+				`canonical event schema not found; parity is UNVERIFIABLE.\n` +
+					`  Looked in:\n${where}\n` +
+					`  Fix by either:\n` +
+					`    - pointing AUTOMATION_METRICS_SCHEMA_PATH at core/schemas/event-schema.yaml, or\n` +
+					`    - checking out core, or\n` +
+					`    - setting ${SEAM_OPT_OUT}=1 to accept undetected schema drift\n` +
+					`      in this environment.`,
 			);
-			expect(SCHEMA_VERSION).toMatch(/^\d+(\.\d+)?$/);
 		});
 		return;
 	}

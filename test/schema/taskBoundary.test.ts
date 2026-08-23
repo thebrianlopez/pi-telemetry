@@ -79,7 +79,16 @@ function boundaries(): any[] {
 	return readEvents().filter((e) => e.event_type === "task_boundary");
 }
 
-/** Write a dispatch trigger in the real production shape. */
+/**
+ * Write a dispatch trigger in the real production shape.
+ *
+ * This used to emit `<name>.json` containing a JSON object. Nothing the
+ * producer has ever written looks like that; the fixture was hand-typed on
+ * the wrong side of the seam and so agreed with the equally wrong consumer.
+ * The shape below matches `dispatch_emit.fish` - `.md` with YAML frontmatter
+ * and an inline-flow `milestones` sequence. See
+ * `test/schema/dispatchContract.test.ts` for the check that keeps it honest.
+ */
 function writeTrigger(
 	epic: string,
 	milestones: string,
@@ -87,18 +96,32 @@ function writeTrigger(
 ) {
 	const d = join(work, ".claude-dispatch");
 	mkdirSync(d, { recursive: true });
-	const file = join(d, `PERSONAL_20260729T000000Z_Pi_${epic}_work.json`);
+	const task = `PERSONAL_20260729T000000Z_Pi_${epic}_work`;
+	const file = join(d, `${task}.md`);
 	writeFileSync(
 		file,
 		opts.malformed
-			? "{ not valid json"
-			: JSON.stringify({
-					epic: `PERSONAL_20260729T000000Z_Pi_${epic}_work.md`,
-					epic_path: `/docs/epics/PERSONAL_..._${epic}_work.md`,
-					milestones,
-					agent_id: "pi-telemetry-agent",
-					dispatched_at: "20260729T000000Z",
-				}),
+			? // Frontmatter opened but never closed, and the body is garbage.
+				`---\nnot: [ a valid\n  sequence\n`
+			: [
+					"---",
+					"schema_version: 1",
+					`task: ${task}`,
+					"agent: pi-telemetry-agent",
+					`epic_path: /docs/epics/PERSONAL_20260729T000000Z_Pi_${epic}_work.md`,
+					"dispatched_at: 20260729T000000Z",
+					`status: ${opts.claimed ? "claimed" : "pending"}`,
+					"claimed_at: null",
+					"completed_at: null",
+					`milestones: [${milestones}]`,
+					"producer: dispatch_emit",
+					"---",
+					"",
+					`# Task: ${task}`,
+					"",
+					"## Response",
+					"",
+				].join("\n"),
 	);
 	if (opts.claimed) writeFileSync(`${file}.claimed`, "");
 	return d;
@@ -199,7 +222,7 @@ describe("F-010 task context resolution", () => {
 		).toMatchObject({ taskId: "chain", source: "chain_key" });
 	});
 
-	it("BT-1: an unparseable trigger does not throw and reports a diagnostic", () => {
+	it("BT-1: a malformed trigger does not throw and still resolves by name", () => {
 		const d = writeTrigger("EPIC-999", "M1", { malformed: true });
 		expect(() => resolveTaskContext({ dispatchDir: d, env: {} })).not.toThrow();
 
@@ -212,15 +235,11 @@ describe("F-010 task context resolution", () => {
 	it("prefers an unclaimed trigger over a claimed one", () => {
 		const d = join(work, ".claude-dispatch");
 		mkdirSync(d, { recursive: true });
-		writeFileSync(
-			join(d, "a_EPIC-100_x.json"),
-			JSON.stringify({ epic: "EPIC-100", milestones: "M1" }),
-		);
-		writeFileSync(join(d, "a_EPIC-100_x.json.claimed"), "");
-		writeFileSync(
-			join(d, "b_EPIC-200_y.json"),
-			JSON.stringify({ epic: "EPIC-200", milestones: "M1" }),
-		);
+		const fm = (epic: string, status: string) =>
+			`---\nepic_path: ${epic}\nmilestones: [M1]\nstatus: ${status}\n---\n`;
+		writeFileSync(join(d, "a_EPIC-100_x.md"), fm("EPIC-100", "claimed"));
+		writeFileSync(join(d, "a_EPIC-100_x.md.claimed"), "");
+		writeFileSync(join(d, "b_EPIC-200_y.md"), fm("EPIC-200", "pending"));
 
 		expect(resolveTaskContext({ dispatchDir: d, env: {} }).taskId).toBe(
 			"EPIC-200-M1",

@@ -56,3 +56,23 @@ pi -e ./extensions/telemetry.ts
 # Verify events
 jq . ~/.automation-metrics/events/$(date +%Y-%m-%d).jsonl | tail -5
 ```
+
+### Seam checks
+
+Two test suites compare literals hard-coded here against their source of truth
+in `core`:
+
+- `test/schema/parity.test.ts` - vendored schema snapshot vs `core/schemas/event-schema.yaml`
+- `test/schema/dispatchContract.test.ts` - dispatch trigger contract vs `core/functions/dispatch_emit.fish`
+
+Both **fail** when `core` cannot be found. That is deliberate: a suite that
+skips the comparison and still reports green is indistinguishable from one that
+verified it. Point `WS_ORG_CORE` (and optionally
+`AUTOMATION_METRICS_SCHEMA_PATH`) at a checkout, or opt out explicitly:
+
+```bash
+SEAM_CHECKS_UNVERIFIED_I_ACCEPT_DRIFT_RISK=1 npm test
+```
+
+That variable appearing in a CI config or shell profile means drift from `core`
+is undetected in that environment. Treat it as a finding, not a default.
