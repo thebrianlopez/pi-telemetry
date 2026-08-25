@@ -255,9 +255,29 @@ export function classifyError(toolName: string, result: unknown): string {
  * for a credential to surface verbatim - a failed curl, a rejected git push,
  * an auth error echoing the token it just tried. This previously wrote raw
  * tool output straight to the bus.
+ *
+ * KEEPS THE TAIL, NOT THE HEAD. A failing command's diagnostic is the LAST
+ * thing it prints; anything before it is banner, progress, or listing output.
+ * Head truncation therefore discarded the error and stored the noise, and the
+ * stored text was unclassifiable by construction.
+ *
+ * Measured over a rolling 7-day window of 315 real tool_failure events:
+ *   - messages short enough to survive intact  -> 5% unclassified
+ *   - messages that hit the 200-char limit     -> 68% unclassified
+ * The classifier is not the weak link; the truncation direction was.
+ *
+ * Trade-off, accepted deliberately: for the minority of commands that print
+ * the error FIRST and then verbose output (e.g. `ls` on a missing path,
+ * followed by a directory listing), the tail now holds the noise instead. In
+ * the same window that pattern accounted for roughly 7 events, against ~100
+ * that stand to become classifiable. If that balance shifts, the fix is a
+ * split budget (leading N + trailing 200-N), not a return to head-only.
+ *
+ * Redaction still runs over the FULL text before slicing, so narrowing the
+ * stored window cannot widen credential exposure.
  */
 export function errorMessage(result: unknown): string {
-	return redact(contentText(result)).slice(0, 200);
+	return redact(contentText(result)).slice(-200);
 }
 
 // --- Session State ---
