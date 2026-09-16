@@ -33,6 +33,17 @@ Events append to `~/.automation-metrics/events/YYYY-MM-DD.jsonl`.
 
 The canonical `core/schemas/event-schema.yaml` is currently **v2.16**. Releases 2.15 and 2.16 only added new event types owned by other producers (chain-eval, agora, and legacy emitters); none of this package's 13 event types changed and no required common field was added, so the 2.14 pin remains accurate for this scope. `test/schema/parity.test.ts` checks the vendored snapshot against the canonical document when a `core` checkout is present.
 
+## Herdr pane footer
+
+The bundled `herdr-pane-status` extension displays `pane <HERDR_PANE_ID>` in Pi's
+footer when running inside Herdr, making the pane ID easy to reference from other
+workspaces. It stays hidden when the environment variable is absent and does not
+change telemetry or Herdr lifecycle reporting. The label is display-only.
+
+After installing or updating, run `/reload` in Pi. If you previously installed
+`~/.config/pi/agent/extensions/herdr-pane-status.ts` separately, remove that
+standalone copy to avoid loading the extension twice.
+
 ## Herdr integration boundary
 
 This package does **not** emit Herdr events. `pi_session_complete`, `dispatch_abandoned`, `workspace_idle`, and `agent_status_stalled` are written by `core`'s observer (`core/functions/herdr-event-emitter.fish`). pi-telemetry models and validates them so both producers share one event contract.
