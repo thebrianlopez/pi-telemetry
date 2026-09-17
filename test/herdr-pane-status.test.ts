@@ -21,8 +21,8 @@ describe("Herdr pane status", () => {
 		vi.stubEnv("HERDR_PANE_ID", "wBR:p1");
 		const { start, setStatus, fg } = harness();
 		start();
-		expect(fg).toHaveBeenCalledWith("accent", "pane wBR:p1");
-		expect(setStatus).toHaveBeenCalledWith("herdr_pane", "pane wBR:p1");
+		expect(fg).toHaveBeenCalledWith("accent", "herdr pane wBR:p1");
+		expect(setStatus).toHaveBeenCalledWith("herdr_pane", "herdr pane wBR:p1");
 	});
 
 	it.each([undefined, ""])("clears the status when the pane ID is %s", (value) => {

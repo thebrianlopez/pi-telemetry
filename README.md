@@ -35,7 +35,7 @@ The canonical `core/schemas/event-schema.yaml` is currently **v2.16**. Releases 
 
 ## Herdr pane footer
 
-The bundled `herdr-pane-status` extension displays `pane <HERDR_PANE_ID>` in Pi's
+The bundled `herdr-pane-status` extension displays `herdr pane <HERDR_PANE_ID>` in Pi's
 footer when running inside Herdr, making the pane ID easy to reference from other
 workspaces. It stays hidden when the environment variable is absent and does not
 change telemetry or Herdr lifecycle reporting. The label is display-only.

@@ -7,7 +7,7 @@ export default function (pi: ExtensionAPI) {
 		const paneId = process.env.HERDR_PANE_ID;
 		ctx.ui.setStatus(
 			"herdr_pane",
-			paneId ? ctx.ui.theme.fg("accent", `pane ${paneId}`) : undefined,
+			paneId ? ctx.ui.theme.fg("accent", `herdr pane ${paneId}`) : undefined,
 		);
 	});
 }
