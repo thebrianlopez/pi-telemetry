@@ -23,6 +23,26 @@ Hooks into Pi's extension lifecycle to emit events matching the canonical automa
 
 The `tool_execution_start` / `tool_execution_end` pair is emitted only under lifecycle detail `full`; the shipped default is `session`.
 
+## Pi and Herdr model display
+
+The sibling `herdr-model` extension shows the active `provider/model` in Pi's footer. Inside a
+Herdr pane it also publishes the expiring `pi_model` presentation token, updating it when Pi changes
+or restores its model and clearing it on clean shutdown. Herdr failures never interrupt Pi, and no
+report is attempted outside a Herdr pane.
+
+Display it in Herdr's expanded Agent sidebar with:
+
+```toml
+[ui.sidebar.agents.rows_by_agent]
+pi = [
+  ["state_icon", "agent", "state_text"],
+  ["$pi_model"],
+  ["workspace", "tab"],
+]
+```
+
+Herdr-launched panes use `HERDR_BIN_PATH`; set `HERDR_BIN` only as a fallback when launching Pi another way and `herdr` is not on `PATH`.
+
 All events carry `harness: "pi"` and `agent_runtime: "pi-coding-agent"` to distinguish from Claude Code hook events.
 
 Events append to `~/.automation-metrics/events/YYYY-MM-DD.jsonl`.
