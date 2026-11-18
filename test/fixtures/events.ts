@@ -58,6 +58,7 @@ export function assistantMessage(
 		cacheRead: number;
 		cacheWrite: number;
 	}> = {},
+	model?: string,
 ) {
 	return {
 		role: "assistant" as const,
@@ -68,6 +69,7 @@ export function assistantMessage(
 			cacheWrite: 0,
 			...usage,
 		},
+		...(model === undefined ? {} : { model }),
 	};
 }
 

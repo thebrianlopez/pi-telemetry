@@ -14,6 +14,7 @@ import telemetry, {
 	classifyError,
 	contentPlaneFields,
 	contentText,
+	creditModelTurn,
 	dateFileName,
 	emit,
 	errorMessage,
@@ -386,6 +387,7 @@ describe("F10 prompt events", () => {
 			cacheRead: 2,
 			cacheWrite: 1,
 			turns: 2,
+			modelTurns: {},
 		});
 	});
 
@@ -439,5 +441,184 @@ describe("boundary conditions", () => {
 	it("truncates error_message to 200 chars", () => {
 		const long = "x".repeat(500);
 		expect(errorMessage([{ type: "text", text: long }])).toHaveLength(200);
+	});
+});
+
+// --- F1: model_distribution from agent_end data (model-attribution-gap POMO) --
+
+describe("F1 aggregateTurnUsage model attribution", () => {
+	it("CT-1: returns modelTurns for two different models", () => {
+		const usage = aggregateTurnUsage([
+			assistantMessage({ input: 10, output: 5 }, "claude-opus-5"),
+			assistantMessage({ input: 4, output: 6 }, "gpt-6-luna"),
+		]);
+		expect(usage.modelTurns).toEqual({ "claude-opus-5": 1, "gpt-6-luna": 1 });
+	});
+
+	it("CT-2: malformed model field is non-throwing, token totals unaffected", () => {
+		const messages = [
+			{
+				role: "assistant" as const,
+				usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 },
+				model: 123, // non-string
+			},
+		];
+		expect(() => aggregateTurnUsage(messages)).not.toThrow();
+		const usage = aggregateTurnUsage(messages);
+		expect(usage.modelTurns).toEqual({});
+		expect(usage.input).toBe(10);
+	});
+
+	it("CT-3: non-array messages still safe", () => {
+		expect(() => aggregateTurnUsage(null)).not.toThrow();
+		const usage = aggregateTurnUsage(null);
+		expect(usage.modelTurns).toEqual({});
+	});
+
+	it("BT-1: mixed-provider session", () => {
+		const usage = aggregateTurnUsage([
+			assistantMessage({ input: 1, output: 1 }, "claude-opus-5"),
+			assistantMessage({ input: 1, output: 1 }, "gpt-6-luna"),
+		]);
+		expect(Object.keys(usage.modelTurns).sort()).toEqual([
+			"claude-opus-5",
+			"gpt-6-luna",
+		]);
+	});
+
+	it("BT-2: zero assistant messages", () => {
+		const usage = aggregateTurnUsage([]);
+		expect(usage).toEqual({
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			turns: 0,
+			modelTurns: {},
+		});
+	});
+
+	it("CT: creditModelTurn dedups by key, does not double-count", () => {
+		const dist: Record<string, number> = {};
+		const seen = new Set<string>();
+		creditModelTurn(dist, seen, "0:gpt-6-luna", "gpt-6-luna", 1);
+		creditModelTurn(dist, seen, "0:gpt-6-luna", "gpt-6-luna", 1);
+		expect(dist["gpt-6-luna"]).toBe(1);
+	});
+
+	it("BT-3: state.modelDistribution accumulates across multiple agent_end calls", async () => {
+		const fire = mountExtension();
+		await fire("session_start");
+		await fire("agent_end", {
+			messages: [assistantMessage({ input: 1, output: 1 }, "claude-opus-5")],
+		});
+		await fire("agent_end", {
+			messages: [assistantMessage({ input: 1, output: 1 }, "claude-opus-5")],
+		});
+		await fire("session_shutdown");
+		const summary = readEvents().at(-1) as any;
+		expect(summary.metadata.model_distribution["claude-opus-5"]).toBe(2);
+	});
+
+	it("CT-4 / RG-1: model_distribution is populated even when model_select never fires", async () => {
+		const fire = mountExtension();
+		await fire("session_start");
+		await fire("agent_end", {
+			messages: [
+				assistantMessage({ input: 100, output: 50 }, "gpt-6-luna"),
+			],
+		});
+		// no model_select fired at all
+		await fire("session_shutdown");
+		const summary = readEvents().at(-1) as any;
+		expect(summary.metadata.total_tokens).toBeGreaterThan(0);
+		expect(summary.metadata.model_distribution).not.toEqual({});
+		expect(summary.metadata.model_distribution["gpt-6-luna"]).toBe(1);
+	});
+
+	it("no double-count when model_select fires for the same turn ordinal as agent_end", async () => {
+		const fire = mountExtension();
+		await fire("session_start");
+		await fire("agent_end", {
+			messages: [assistantMessage({ input: 10, output: 5 }, "gpt-6-luna")],
+		});
+		await fire("model_select", {
+			model: { id: "gpt-6-luna" },
+			previousModel: undefined,
+			source: "set",
+		});
+		await fire("session_shutdown");
+		const summary = readEvents().at(-1) as any;
+		expect(summary.metadata.model_distribution["gpt-6-luna"]).toBe(1);
+	});
+
+	it("RG-2: pre-2026-08-05 GPT zero-token pattern does not regress", async () => {
+		const fire = mountExtension();
+		await fire("session_start");
+		await fire("agent_end", {
+			messages: [
+				assistantMessage({ input: 100, output: 50 }, "gpt-5.4-mini"),
+			],
+		});
+		await fire("session_shutdown");
+		const summary = readEvents().at(-1) as any;
+		expect(summary.metadata.total_tokens).toBeGreaterThan(0);
+	});
+});
+
+// --- F2: attribution completeness guard (model-attribution-gap POMO) --------
+
+describe("F2 attribution_incomplete guard", () => {
+	it("CT-1: flag set on true positive", () => {
+		const state: SessionState = {
+			...freshState(),
+			inputTokens: 5000,
+			modelDistribution: {},
+		};
+		const { metadata } = summaryMetadata(state, state.startedAt);
+		expect(metadata.attribution_incomplete).toBe(true);
+	});
+
+	it("CT-2: flag absent on healthy session", () => {
+		const state: SessionState = {
+			...freshState(),
+			inputTokens: 5000,
+			modelDistribution: { "claude-opus-5": 3 },
+		};
+		const { metadata } = summaryMetadata(state, state.startedAt);
+		expect("attribution_incomplete" in metadata).toBe(false);
+	});
+
+	it("CT-3: flag absent on zero-token session", () => {
+		const state: SessionState = { ...freshState(), modelDistribution: {} };
+		const { metadata } = summaryMetadata(state, state.startedAt);
+		expect("attribution_incomplete" in metadata).toBe(false);
+	});
+
+	it("BT-1: end-to-end synthetic session emits the flag in the JSONL line", async () => {
+		const fire = mountExtension();
+		await fire("session_start");
+		await fire("agent_end", {
+			messages: [
+				{
+					role: "assistant" as const,
+					usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 },
+					// no model field at all
+				},
+			],
+		});
+		await fire("session_shutdown");
+		const raw = readFileSync(join(dir, dateFileName(new Date())), "utf8");
+		expect(raw).toContain('"attribution_incomplete":true');
+	});
+
+	it("RG-1: a regression that reintroduces empty model_distribution under nonzero tokens is caught", () => {
+		const state: SessionState = {
+			...freshState(),
+			inputTokens: 1000,
+			modelDistribution: {}, // simulates F1 silently regressing
+		};
+		const { metadata } = summaryMetadata(state, state.startedAt);
+		expect(metadata.attribution_incomplete).toBe(true);
 	});
 });

@@ -23,6 +23,23 @@ Hooks into Pi's extension lifecycle to emit events matching the canonical automa
 
 The `tool_execution_start` / `tool_execution_end` pair is emitted only under lifecycle detail `full`; the shipped default is `session`.
 
+### Model attribution coverage
+
+`session_summary.metadata.model_distribution` (turn count per model) is populated from two
+independent paths: directly from each `agent_end` event's assistant messages (primary, covers
+every dispatch path that reaches `agent_end` at all), and from the `model_select` hook as a
+confirming signal (historically unreliable -- see
+`~/docs/pomo/AUTOMATION_20261118T130020Z_POMO_pi-telemetry-model-attribution-gap.md` for why
+this extension no longer depends on `model_select` alone). If `total_tokens > 0` and
+`model_distribution` is still empty at emission time, `session_summary.metadata.attribution_incomplete`
+is set to `true` so the gap is visible in the data itself rather than requiring manual investigation.
+
+`test/schema/pi-extension-api.test.ts` type-checks this extension's assumptions about Pi's own
+extension-API event shapes against the real installed `@earendil-works/pi-coding-agent` / `pi-ai`
+packages (`npm run typecheck`), and flags when the installed version has moved since last reviewed.
+`.github/workflows/pi-version-watch.yml` runs this gate on a schedule and opens a PR when a new Pi
+version is available.
+
 ## Pi and Herdr model display
 
 The sibling `herdr-model` extension shows the active `provider/model` in Pi's footer. Inside a

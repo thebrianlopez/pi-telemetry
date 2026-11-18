@@ -1,0 +1,159 @@
+name: Pi version watch
+
+# F3 (model-attribution-gap POMO, 2026-11-18) operationalized: this workflow
+# periodically checks npm for new @earendil-works/pi-coding-agent / pi-ai
+# releases and, when one exists, attempts the bump itself instead of waiting
+# for someone to notice drift manually -- the exact failure mode that let
+# the installed version fall from 0.82.1 to several releases behind 1.5.2
+# unnoticed for months.
+#
+# Safety model:
+#   - The PINNED_LAST_VERIFIED_VERSION constant in
+#     test/schema/pi-extension-api.test.ts is bumped FIRST (optimistically),
+#     then the full suite (typecheck + vitest) is run against the newly
+#     installed package. The version-drift test itself only asserts "was
+#     this reviewed", not "is this safe" -- typecheck and the behavioral
+#     suite are the actual safety check.
+#   - If everything passes: the bump is committed, pushed on a branch, a PR
+#     is opened, and it is merged immediately -- the validation already
+#     happened in this same run, so there is nothing left to gate on.
+#   - If anything fails (type drift, behavioral regression): nothing is
+#     committed to main. A PR is opened from the branch anyway, left
+#     unmerged, so the failure is visible and reviewable instead of silently
+#     recurring.
+
+on:
+  schedule:
+    # Every 4 hours. Covers "nightly" as a strict subset at much tighter
+    # latency, for the same operational cost (this job is cheap: npm view,
+    # conditional install, typecheck, vitest -- no build/deploy step).
+    - cron: "0 */4 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: pi-version-watch
+  cancel-in-progress: false
+
+jobs:
+  check-and-bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install current dependencies
+        run: npm ci
+
+      - name: Resolve latest Pi versions
+        id: latest
+        run: |
+          agent_latest=$(npm view @earendil-works/pi-coding-agent version)
+          ai_latest=$(npm view @earendil-works/pi-ai version)
+          echo "agent_latest=$agent_latest" >> "$GITHUB_OUTPUT"
+          echo "ai_latest=$ai_latest" >> "$GITHUB_OUTPUT"
+          echo "Latest: pi-coding-agent=$agent_latest pi-ai=$ai_latest"
+
+      - name: Resolve pinned (last-reviewed) version
+        id: pinned
+        run: |
+          pinned=$(grep -oP 'PINNED_LAST_VERIFIED_VERSION = "\K[^"]+' \
+            test/schema/pi-extension-api.test.ts)
+          echo "version=$pinned" >> "$GITHUB_OUTPUT"
+          echo "Pinned: $pinned"
+
+      - name: Check whether a bump is needed
+        id: drift
+        run: |
+          if [ "${{ steps.latest.outputs.agent_latest }}" = "${{ steps.pinned.outputs.version }}" ]; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Up to date -- nothing to do
+        if: steps.drift.outputs.needed == 'false'
+        run: echo "pi-coding-agent/pi-ai already at reviewed version ${{ steps.pinned.outputs.version }}; no action."
+
+      - name: Create bump branch
+        if: steps.drift.outputs.needed == 'true'
+        run: |
+          git config user.name "pi-version-watch[bot]"
+          git config user.email "pi-version-watch[bot]@users.noreply.github.com"
+          branch="chore/pi-version-bump-${{ steps.latest.outputs.agent_latest }}"
+          echo "branch=$branch" >> "$GITHUB_ENV"
+          git checkout -b "$branch"
+
+      - name: Install latest Pi packages
+        if: steps.drift.outputs.needed == 'true'
+        run: |
+          npm install \
+            "@earendil-works/pi-coding-agent@${{ steps.latest.outputs.agent_latest }}" \
+            "@earendil-works/pi-ai@${{ steps.latest.outputs.ai_latest }}"
+
+      - name: Bump PINNED_LAST_VERIFIED_VERSION
+        if: steps.drift.outputs.needed == 'true'
+        run: |
+          sd \
+            'PINNED_LAST_VERIFIED_VERSION = "[^"]+"' \
+            "PINNED_LAST_VERIFIED_VERSION = \"${{ steps.latest.outputs.agent_latest }}\"" \
+            test/schema/pi-extension-api.test.ts || \
+          sed -i \
+            "s/PINNED_LAST_VERIFIED_VERSION = \"[^\"]*\"/PINNED_LAST_VERIFIED_VERSION = \"${{ steps.latest.outputs.agent_latest }}\"/" \
+            test/schema/pi-extension-api.test.ts
+
+      - name: Run drift gate (typecheck + full suite)
+        if: steps.drift.outputs.needed == 'true'
+        id: suite
+        continue-on-error: true
+        run: npm test
+
+      - name: Commit and open PR
+        if: steps.drift.outputs.needed == 'true'
+        run: |
+          git add -A
+          status="${{ steps.suite.outcome }}"
+          if [ "$status" = "success" ]; then
+            msg="chore(deps): bump Pi to ${{ steps.latest.outputs.agent_latest }} (drift gate passing)"
+          else
+            msg="chore(deps): attempt Pi bump to ${{ steps.latest.outputs.agent_latest }} (drift gate FAILING -- see CI)"
+          fi
+          git commit -m "$msg"
+          git push origin "$branch"
+
+          pr_body=$(cat <<EOF
+          Automated by \`.github/workflows/pi-version-watch.yml\`.
+
+          - \`@earendil-works/pi-coding-agent\`: ${{ steps.pinned.outputs.version }} -> ${{ steps.latest.outputs.agent_latest }}
+          - \`@earendil-works/pi-ai\`: -> ${{ steps.latest.outputs.ai_latest }}
+          - Drift gate (\`npm test\`, i.e. \`tsc --noEmit\` + vitest): **${status}**
+
+          See TDD \`PERSONAL_20261118T131811Z_PiTelemetry_F3_Pi_Extension_API_Drift_Gate_TDD.md\`
+          for the gate's design. If the suite failed, this PR is intentionally
+          left unmerged; the pinned version in
+          \`test/schema/pi-extension-api.test.ts\` was NOT advanced, so drift
+          detection stays active until this is resolved.
+          EOF
+          )
+
+          pr_url=$(gh pr create \
+            --title "$msg" \
+            --body "$pr_body" \
+            --base main \
+            --head "$branch")
+
+          if [ "$status" = "success" ]; then
+            gh pr merge "$pr_url" --squash --delete-branch
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}

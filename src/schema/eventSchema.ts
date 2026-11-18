@@ -29,7 +29,7 @@
  * a minor bump (2.14 -> 2.15, which only ever adds optional fields) does not
  * invalidate every historical event or every fish-emitted event.
  */
-export const SCHEMA_VERSION = "2.14";
+export const SCHEMA_VERSION = "2.17";
 
 /** Major component of a schema version string: "2.14" -> "2", "2" -> "2". */
 export function majorVersion(v: string): string {
@@ -255,6 +255,10 @@ export const EVENT_RULES: Record<string, EventRule> = {
 			total_tokens: { kind: "number" },
 			turns: { kind: "number" },
 			signal_source: { kind: "string" },
+			// F2 (model-attribution-gap POMO, 2026-11-18): present and `true`
+			// only when total_tokens > 0 and model_distribution is empty.
+			// Absent (not `false`) otherwise — additive, non-breaking.
+			attribution_incomplete: { kind: "boolean", required: false },
 		},
 	},
 

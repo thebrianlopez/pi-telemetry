@@ -297,6 +297,12 @@ export interface SessionState {
 	toolErrors: number;
 	toolDistribution: Record<string, number>;
 	modelDistribution: Record<string, number>;
+	/**
+	 * F1 dedup guard: turn identity keys already credited to modelDistribution,
+	 * so the same logical turn is never double-counted across the agent_end-
+	 * derived path and the model_select hook's confirming write.
+	 */
+	seenModelTurnKeys: Set<string>;
 	promptCount: number;
 	turns: number;
 	droppedEvents: number;
@@ -334,6 +340,7 @@ export function freshState(): SessionState {
 		toolErrors: 0,
 		toolDistribution: {},
 		modelDistribution: {},
+		seenModelTurnKeys: new Set<string>(),
 		promptCount: 0,
 		turns: 0,
 		droppedEvents: 0,
@@ -600,6 +607,15 @@ export interface TurnUsage {
 	cacheRead: number;
 	cacheWrite: number;
 	turns: number;
+	/**
+	 * modelId -> turn count, scoped to this single `agent_end` call only.
+	 *
+	 * F1 (model-attribution-gap POMO, 2026-11-18): `AssistantMessage.model` is
+	 * already present on every message this function reads for `usage` — this
+	 * populates model attribution from the same iteration instead of relying
+	 * solely on the `model_select` hook, which fires for <2% of sessions.
+	 */
+	modelTurns: Record<string, number>;
 }
 
 /** Aggregate token usage across the assistant messages of one agent_end turn. */
@@ -610,6 +626,7 @@ export function aggregateTurnUsage(messages: unknown): TurnUsage {
 		cacheRead: 0,
 		cacheWrite: 0,
 		turns: 0,
+		modelTurns: {},
 	};
 	// Pi payload shapes vary across versions; a non-array `messages` must not
 	// throw inside a lifecycle hook.
@@ -617,15 +634,43 @@ export function aggregateTurnUsage(messages: unknown): TurnUsage {
 	for (const message of messages) {
 		if (!isAssistantMessage(message)) continue;
 		const u = (message as { usage?: unknown }).usage;
-		if (!u || typeof u !== "object") continue;
-		const m = u as Record<string, unknown>;
-		usage.input += Number(m.input) || 0;
-		usage.output += Number(m.output) || 0;
-		usage.cacheRead += Number(m.cacheRead) || 0;
-		usage.cacheWrite += Number(m.cacheWrite) || 0;
-		usage.turns++;
+		if (u && typeof u === "object") {
+			const m = u as Record<string, unknown>;
+			usage.input += Number(m.input) || 0;
+			usage.output += Number(m.output) || 0;
+			usage.cacheRead += Number(m.cacheRead) || 0;
+			usage.cacheWrite += Number(m.cacheWrite) || 0;
+			usage.turns++;
+		}
+
+		// F1: model attribution, independent of usage validity. A message with
+		// valid usage but a missing/malformed `model` still contributes to
+		// token totals above; it is simply excluded from modelTurns (silent
+		// skip, error class model_field_missing, never throws).
+		const modelId = (message as { model?: unknown }).model;
+		if (typeof modelId === "string" && modelId.length > 0) {
+			usage.modelTurns[modelId] = (usage.modelTurns[modelId] || 0) + 1;
+		}
 	}
 	return usage;
+}
+
+/**
+ * F1 dedup: credit a turn to `modelDistribution` at most once per turn
+ * identity key, across both the agent_end-derived path and the model_select
+ * hook's confirming write. Pure with respect to its inputs except for the
+ * two mutable collections it is explicitly given to update.
+ */
+export function creditModelTurn(
+	modelDistribution: Record<string, number>,
+	seenKeys: Set<string>,
+	key: string,
+	modelId: string,
+	count = 1,
+): void {
+	if (seenKeys.has(key)) return;
+	seenKeys.add(key);
+	modelDistribution[modelId] = (modelDistribution[modelId] || 0) + count;
 }
 
 /** Map a file path to a coarse language label for session enrichment. */
@@ -767,9 +812,18 @@ export function summaryMetadata(
 			? (state.cacheReadTokens / effectiveInput) * 100
 			: 0;
 
+	// F2 (model-attribution-gap POMO, 2026-11-18): flag the exact defect
+	// class this POMO was manually discovered via `jq` — nonzero tokens with
+	// no model attribution — so a future regression is visible in the data
+	// itself. Omitted entirely (never emitted as `false`) when attribution is
+	// complete, to keep this an additive, non-breaking schema change.
+	const attributionIncomplete =
+		totalTokens > 0 && Object.keys(state.modelDistribution).length === 0;
+
 	return {
 		durationMs,
 		metadata: {
+			...(attributionIncomplete ? { attribution_incomplete: true } : {}),
 			duration_minutes: durationMinutes,
 			input_tokens: state.inputTokens,
 			output_tokens: state.outputTokens,
@@ -1119,6 +1173,7 @@ export default function (pi: ExtensionAPI) {
 			cacheRead: turnCacheRead,
 			cacheWrite: turnCacheWrite,
 			turns: turnCount,
+			modelTurns,
 		} = aggregateTurnUsage(event.messages);
 
 		state.turns += turnCount;
@@ -1126,6 +1181,29 @@ export default function (pi: ExtensionAPI) {
 		state.outputTokens += turnOutput;
 		state.cacheReadTokens += turnCacheRead;
 		state.cacheWriteTokens += turnCacheWrite;
+
+		// F1: credit model attribution from agent_end data itself, independent
+		// of whether the model_select hook ever fires for this session.
+		//
+		// Dedup key is `${state.turns}:${modelId}` — the turn ordinal *after*
+		// this call's turns have been added above, paired with the model id.
+		// This is deliberately turn-ordinal-based rather than wall-clock-based:
+		// `model_select` and `agent_end` are two distinct lifecycle events with
+		// no shared timestamp to join on, so a real-time key would almost never
+		// collide and would defeat the dedup entirely. Turn ordinal is the best
+		// available shared coordinate between the two paths today; see TDD F1
+		// §7 for the known limitation (false collisions possible under rapid
+		// same-session model switching) and §13 Q1 for the deferred decision to
+		// revisit this once real production data is available.
+		for (const [modelId, count] of Object.entries(modelTurns)) {
+			creditModelTurn(
+				state.modelDistribution,
+				state.seenModelTurnKeys,
+				`${state.turns}:${modelId}`,
+				modelId,
+				count,
+			);
+		}
 
 		const messages = Array.isArray(event.messages) ? event.messages : [];
 
@@ -1176,8 +1254,17 @@ export default function (pi: ExtensionAPI) {
 				? (event.model as { id?: string }).id || "unknown"
 				: String(event.model);
 
-		state.modelDistribution[modelId] =
-			(state.modelDistribution[modelId] || 0) + 1;
+		// F1: model_select is now a confirming signal, not the sole writer.
+		// Dedup against any agent_end-derived credit already recorded for the
+		// current turn ordinal (same `${state.turns}:${modelId}` key scheme as
+		// the agent_end handler) so a turn is never double-counted across both
+		// paths.
+		creditModelTurn(
+			state.modelDistribution,
+			state.seenModelTurnKeys,
+			`${state.turns}:${modelId}`,
+			modelId,
+		);
 
 		lifecycle("model_select");
 

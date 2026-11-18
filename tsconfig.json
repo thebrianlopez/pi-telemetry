@@ -1,0 +1,22 @@
+{
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"strict": true,
+		"noEmit": true,
+		"skipLibCheck": true,
+		"esModuleInterop": true,
+		"resolveJsonModule": true,
+		"allowImportingTsExtensions": true,
+		"types": ["node"]
+	},
+	"include": [
+		"extensions/telemetry.ts",
+		"src/**/*.ts",
+		"test/schema/pi-extension-api.test.ts"
+	],
+	"exclude": [
+		"extensions/turn-efficiency.ts"
+	]
+}
