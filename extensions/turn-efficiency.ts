@@ -22,7 +22,7 @@
  * rate to the session average. If the rolling avg is ≥1.75× the session avg,
  * the arrow indicator (↑) is shown and the color shifts warm.
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const ACCEL_WINDOW = 3;      // turns to use for rolling average
 const ACCEL_THRESHOLD = 1.75; // rolling avg must be this × session avg to flag
@@ -49,7 +49,7 @@ export default function (pi: ExtensionAPI) {
     return `${Math.round(n / 1000)}k`;
   }
 
-  function render(ctx: Parameters<Parameters<typeof pi.on<"turn_end">>[1]>[1]) {
+  function render(ctx: ExtensionContext) {
     if (turns === 0) return;
 
     // ── Token rate ────────────────────────────────────────────────────────
@@ -137,7 +137,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("message_end", async (event) => {
     if (event.message.role !== "assistant") return;
-    const usage = (event.message as any).usage;
+    const usage = event.message.usage;
     if (!usage) return;
     totalOutputTokens += usage.output ?? 0;
     totalInputTokens += (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);

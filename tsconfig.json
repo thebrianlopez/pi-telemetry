@@ -12,11 +12,8 @@
 		"types": ["node"]
 	},
 	"include": [
-		"extensions/telemetry.ts",
+		"extensions/**/*.ts",
 		"src/**/*.ts",
 		"test/schema/pi-extension-api.test.ts"
-	],
-	"exclude": [
-		"extensions/turn-efficiency.ts"
 	]
 }
