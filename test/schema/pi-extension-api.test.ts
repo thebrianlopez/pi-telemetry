@@ -83,7 +83,7 @@ void assertAgentEndShape;
 /** Bump deliberately, only after manually reviewing the new version's
  *  changelog/type declarations for breaking changes to the fields this
  *  extension depends on. */
-const PINNED_LAST_VERIFIED_VERSION = "1.5.2";
+const PINNED_LAST_VERIFIED_VERSION = "1.6.0";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
