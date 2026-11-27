@@ -18,8 +18,8 @@
     "vitest": "^3.2.4"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "^1.6.1",
-    "@earendil-works/pi-coding-agent": "^1.6.1"
+    "@earendil-works/pi-ai": "^1.7.0",
+    "@earendil-works/pi-coding-agent": "^1.7.0"
   },
   "pi": {
     "extensions": [
